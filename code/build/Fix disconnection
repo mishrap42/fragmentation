@@ -1,0 +1,338 @@
+library(here)
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(readxl)
+library(binsreg)
+library(lubridate)
+install.packages("binsreg")
+
+
+# This stores your repository path as a function "here()"
+if (grepl("ahaanj", here())) {
+  dropbox_dir <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/"
+} else if (grepl("mishrap", here())) {
+  dropbox_dir <- "/Users/mishrap/Dropbox (Personal)/Protected Area Fragmentation/"
+} else {
+  stop("Username not recognized. Please update the script with your Dropbox path.")
+}
+
+# Read in the shapefile of protected areas
+pa <- st_read(paste0(dropbox_dir, 'Data/protected sites/protectedsites.shp'))
+
+# Get a stratified sample - 50 areas from each country
+set.seed(123)
+pa_sample <- pa %>%
+  group_by(cddaCountr) %>%
+  slice_sample(prop = 1) %>%
+  slice_head(n = 50) %>%
+  ungroup()
+
+cat("Total sampled areas:", nrow(pa_sample), "\n")
+
+# Map it
+ggplot(pa_sample) +
+  geom_sf(fill = "darkgreen", color = "black", alpha = 0.6, size = 0.1) +
+  theme_minimal() +
+  labs(title = "Stratified Sample of European Protected Areas")
+
+# ========== NINA'S SHAPE METRICS - CORRECTED IMPLEMENTATION ==========
+# All require sampling points and computing pairwise distances
+
+library(sf)
+library(dplyr)
+
+# Function to sample interior points from a polygon
+sample_interior_points <- function(geom, n_points = 100) {
+  # Generate random points inside the polygon
+  points <- st_sample(geom, size = n_points, type = "random")
+  return(points)
+}
+
+# Function to sample perimeter points from a polygon
+sample_perimeter_points <- function(geom, n_points = 100) {
+  # Cast to linestring and sample along the boundary
+  boundary <- st_cast(st_boundary(geom), "LINESTRING")
+  points <- st_line_sample(boundary, n = n_points)
+  # st_line_sample returns multipoint, convert to individual points
+  points <- st_cast(points, "POINT")
+  return(points)
+}
+
+# Calculate shape metrics for all protected areas
+pa_shapes <- pa_sample %>%
+  mutate(
+    area_km2 = as.numeric(st_area(geometry)) / 1e6,
+    perimeter_km = as.numeric(st_length(st_cast(geometry, "MULTILINESTRING"))) / 1000
+  ) %>%
+  rowwise() %>%
+  mutate(
+    centroid = list(st_centroid(geometry)),
+    
+    # Disconnection: avg distance between interior point pairs
+    disconnection_index = {
+      interior_pts <- sample_interior_points(geometry, n_points = 100)
+      if (length(interior_pts) < 2) {
+        NA_real_
+      } else {
+        dist_matrix <- st_distance(interior_pts, interior_pts)
+        dist_values <- as.numeric(dist_matrix[upper.tri(dist_matrix)])
+        round(mean(dist_values, na.rm = TRUE) / 1000, 3)
+      }
+    },
+    
+    # Remoteness: avg distance from interior points to center
+    remoteness = {
+      interior_pts <- sample_interior_points(geometry, n_points = 100)
+      if (length(interior_pts) < 1) {
+        NA_real_
+      } else {
+        distances <- st_distance(interior_pts, centroid[[1]])
+        round(mean(as.numeric(distances), na.rm = TRUE) / 1000, 3)
+      }
+    },
+    
+    # Spin: avg distance from boundary points to center
+    spin = {
+      perimeter_pts <- sample_perimeter_points(geometry, n_points = 100)
+      if (length(perimeter_pts) < 1) {
+        NA_real_
+      } else {
+        distances <- st_distance(perimeter_pts, centroid[[1]])
+        round(mean(as.numeric(distances), na.rm = TRUE) / 1000, 3)
+      }
+    },
+    
+    # Range: avg distance between boundary point pairs
+    range_km = {
+      perimeter_pts <- sample_perimeter_points(geometry, n_points = 100)
+      if (length(perimeter_pts) < 2) {
+        NA_real_
+      } else {
+        dist_matrix <- st_distance(perimeter_pts, perimeter_pts)
+        dist_values <- as.numeric(dist_matrix[upper.tri(dist_matrix)])
+        round(mean(dist_values, na.rm = TRUE) / 1000, 3)
+      }
+    }
+  ) %>%
+  ungroup() %>%
+  select(-centroid)
+
+print(pa_shapes$disconnection_index[1], digits = 10)
+
+# Summary by country (medians)
+shape_summary <- pa_shapes %>%
+  st_drop_geometry() %>%
+  group_by(cddaCountr) %>%
+  summarize(
+    n_areas = n(),
+    med_area = median(area_km2, na.rm = TRUE),
+    med_disconnection = median(disconnection_index, na.rm = TRUE),
+    med_remoteness = median(remoteness, na.rm = TRUE),
+    med_spin = median(spin, na.rm = TRUE),
+    med_range = median(range_km, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(med_area))
+
+View(shape_summary)
+
+pa_shapes$disconnection_index[1:10]
+
+
+# ========== FIND EXTREMES FOR EACH METRIC ==========
+
+# 1. DISCONNECTION INDEX (higher = more spread out internally)
+most_disconnected <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(desc(disconnection_index)) %>%
+  select(cddaId, siteName, cddaCountr, disconnection_index, area_km2) %>%
+  head(2)
+
+least_disconnected <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(disconnection_index) %>%
+  select(cddaId, siteName, cddaCountr, disconnection_index, area_km2) %>%
+  head(2)
+
+# 2. REMOTENESS (higher = farther from center on average)
+most_remote <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(desc(remoteness)) %>%
+  select(cddaId, siteName, cddaCountr, remoteness, area_km2) %>%
+  head(2)
+
+least_remote <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(remoteness) %>%
+  select(cddaId, siteName, cddaCountr, remoteness, area_km2) %>%
+  head(2)
+
+# 3. SPIN (higher = perimeter is farther from center)
+highest_spin <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(desc(spin)) %>%
+  select(cddaId, siteName, cddaCountr, spin, area_km2) %>%
+  head(2)
+
+lowest_spin <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(spin) %>%
+  select(cddaId, siteName, cddaCountr, spin, area_km2) %>%
+  head(2)
+
+# 4. RANGE (higher = larger perimeter extent)
+largest_range <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(desc(range_km)) %>%
+  select(cddaId, siteName, cddaCountr, range_km, area_km2) %>%
+  head(2)
+
+smallest_range <- pa_shapes %>%
+  st_drop_geometry() %>%
+  arrange(range_km) %>%
+  select(cddaId, siteName, cddaCountr, range_km, area_km2) %>%
+  head(2)
+
+# PRINT ALL RESULTS
+cat("\n========== DISCONNECTION INDEX ==========\n")
+cat("Economic interpretation: Average internal travel distance\n")
+cat("\nMOST DISCONNECTED (largest internal distances):\n")
+print(most_disconnected)
+cat("\nLEAST DISCONNECTED (smallest internal distances):\n")
+print(least_disconnected)
+
+cat("\n========== REMOTENESS ==========\n")
+cat("Economic interpretation: Average distance to center\n")
+cat("\nMOST REMOTE (farthest from center):\n")
+print(most_remote)
+cat("\nLEAST REMOTE (closest to center):\n")
+print(least_remote)
+
+cat("\n========== SPIN ==========\n")
+cat("Economic interpretation: Average boundary-to-center distance\n")
+cat("\nHIGHEST SPIN (boundary far from center):\n")
+print(highest_spin)
+cat("\nLOWEST SPIN (boundary close to center):\n")
+print(lowest_spin)
+
+cat("\n========== RANGE ==========\n")
+cat("Economic interpretation: Average boundary extent\n")
+cat("\nLARGEST RANGE (biggest boundary extent):\n")
+print(largest_range)
+cat("\nSMALLEST RANGE (smallest boundary extent):\n")
+print(smallest_range)
+
+# ========== VISUALIZE EXAMPLE ==========
+specific_id <- most_disconnected$cddaId[1]
+pa_single <- pa_shapes %>% filter(cddaId == specific_id)
+
+# First plot
+p1 <- ggplot(pa_single) +
+  geom_sf(fill = "lightgreen", color = "darkgreen", size = 1) +
+  theme_minimal() +
+  labs(
+    title = paste("Example:", pa_single$siteName),
+    subtitle = paste("Country:", pa_single$cddaCountr)
+  )
+
+# Example: another polygon to compare
+specific_id2 <- least_disconnected$cddaId[2]
+pa_single2 <- pa_shapes %>% filter(cddaId == specific_id2)
+
+# Second plot
+p2 <- ggplot(pa_single2) +
+  geom_sf(fill = "lightblue", color = "navy", size = 1) +
+  theme_minimal() +
+  labs(
+    title = paste("Example:", pa_single2$siteName),
+    subtitle = paste("Country:", pa_single2$cddaCountr)
+  )
+
+# Display both side by side
+grid.arrange(p1, p2, ncol = 2)
+
+
+cat("\n=== EXAMPLE AREA METRICS ===\n")
+cat("Site Name:", pa_single$siteName, "\n")
+cat("Country:", pa_single$cddaCountr, "\n")
+cat("Area:", round(pa_single$area_km2, 2), "km²\n")
+cat("Disconnection Index:", round(pa_single$disconnection_index, 3), "km (avg internal distance)\n")
+cat("Remoteness:", round(pa_single$remoteness, 3), "km (avg distance to center)\n")
+cat("Spin:", round(pa_single$spin, 3), "km (avg boundary-to-center distance)\n")
+cat("Range:", round(pa_single$range_km, 3), "km (avg boundary extent)\n")
+
+
+# ------------ PLOT INDEX AVERAGES BY TIME 
+
+all_data <- pa_shapes %>%
+  st_drop_geometry() %>%
+  mutate(legal_year = as.numeric(substr(as.character(legalFound), 1, 4))) %>%
+  filter(!is.na(legal_year))
+
+by_year <- all_data %>%
+  group_by(legal_year) %>%
+  summarize(
+    range = median(range_km, na.rm = TRUE),
+    disconnection = median(disconnection_index, na.rm = TRUE),
+    spin = median(spin, na.rm = TRUE),
+    remoteness = median(remoteness, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(legal_year)
+
+p1 <- ggplot(by_year, aes(x = legal_year, y = range)) +
+  geom_point(color = "#4DAF4A", size = 3) +
+  geom_line(color = "#4DAF4A", linewidth = 1) +
+  scale_x_continuous(limits = c(1975, 2025)) +
+  scale_y_continuous(limits = c(0, 15)) +
+  labs(title = "Range", x = "Time", y = "Median (km)") +
+  theme_minimal()
+
+p2 <- ggplot(by_year, aes(x = legal_year, y = disconnection)) +
+  geom_point(color = "#E41A1C", size = 3) +
+  geom_line(color = "#E41A1C", linewidth = 1) +
+  scale_x_continuous(limits = c(1975, 2025)) +
+  scale_y_continuous(limits = c(0.8, 1.2)) +
+  labs(title = "Disconnection", x = "Time", y = "Median (km)") +
+  theme_minimal()
+
+p3 <- ggplot(by_year, aes(x = legal_year, y = spin)) +
+  geom_point(color = "#377EB8", size = 3) +
+  geom_line(color = "#377EB8", linewidth = 1) +
+  scale_x_continuous(limits = c(1975, 2025)) +
+  scale_y_continuous(limits = c(0.15, 0.6)) +
+  labs(title = "Spin", x = "Time", y = "Median (km)") +
+  theme_minimal()
+
+p4 <- ggplot(by_year, aes(x = legal_year, y = remoteness)) +
+  geom_point(color = "#984EA3", size = 3) +
+  geom_line(color = "#984EA3", linewidth = 1) +
+  scale_x_continuous(limits = c(1975, 2025)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Remoteness", x = "Time", y = "Median (km)") +
+  theme_minimal()
+
+gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+# -----------
+
+# Prepare data
+binned_data <- pa_shapes %>%
+  st_drop_geometry() %>%
+  filter(!is.na(disconnection_index) & !is.na(spin))
+
+# Simple regression plot
+ggplot(binned_data, aes(x = disconnection_index, y = spin)) +
+  geom_point(alpha = 0.4, color = "#377EB8", size = 2) +
+  geom_smooth(method = "lm", color = "#E41A1C", se = TRUE, linewidth = 1.5) +
+  scale_x_continuous(limits = c(0, 2)) +
+  scale_y_continuous(limits = c(0.0, 1.0)) +
+  labs(
+    title = "Spin vs Disconnection Index",
+    x = "Disconnection Index (km)",
+    y = "Spin Index (km)"
+  ) +
+  theme_minimal()
+

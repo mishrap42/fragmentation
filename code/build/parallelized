@@ -1,0 +1,324 @@
+if (!require('binsreg')) install.packages("binsreg")
+install.packages("lubridate")
+install.packages("Hmisc")
+install.packages("fixest")
+install.packages("countrycode")
+
+library(here)        # Manage file paths relative to project root
+library(sf)          # Spatial data handling (reading shapefiles, geometric operations)
+library(ggplot2)     # Data visualization and plotting
+library(dplyr)       # Data manipulation (filtering, grouping, summarizing)
+library(gridExtra)   # Arrange multiple plots side-by-side
+library(readxl)      # Read Excel files
+library(binsreg)     # Binned regression plots
+library(lubridate)   # Date/time manipulation
+library(Hmisc)       # Miscellaneous data analysis functions
+library(fixest)      # Fast fixed-effects regressions
+library(countrycode) # Convert country codes/names
+
+if (grepl("ahaanj", here())) {
+  dropbox_dir <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/"
+} else if (grepl("mishrap", here())) {
+  dropbox_dir <- "/Users/mishrap/Dropbox (Personal)/Protected Area Fragmentation/"
+} else {
+  stop("Username not recognized. Please update the script with your Dropbox path.")
+}
+
+intermediate_data_dir = file.path(dropbox_dir, 'Data/build')
+figure_dir = file.path(dropbox_dir, 'Figures', '1_calculate_shapes')
+if (!dir.exists(figure_dir)) dir.create(figure_dir, recursive = TRUE)
+
+pa <- st_read(paste0(dropbox_dir, 'Data/raw/protected sites/protectedsites.shp'))
+
+# Get a stratified sample - 50 areas from each country
+set.seed(123)
+pa_sample <- pa %>%
+  group_by(legalFound, cddaCountr) %>%
+  slice_sample(n = 5) %>%
+  ungroup()
+
+cat("Total sampled areas:", nrow(pa_sample), "\n")
+
+print('Country counts: validation of sampling')
+pa_sample %>% st_drop_geometry() %>% group_by(cddaCountr) %>% summarize(n = n()) %>% print(n = Inf)
+
+print('Foundation year counts:')
+pa_sample %>% st_drop_geometry() %>% group_by(legalFound) %>% summarize(n = n()) %>% print(n = Inf)
+
+print('Checking shape validity:')
+pa_sample$valid <- st_is_valid(pa_sample)
+sprintf('Number of valid geometries: %d out of %d\n', sum( (pa_sample %>% st_drop_geometry())$valid), nrow(pa_sample))
+
+# ========== NINA'S SHAPE METRICS - CORRECTED IMPLEMENTATION ==========
+# All require sampling points and computing pairwise distances
+
+# Function to sample interior points from a polygon
+sample_interior_points <- function(geom, n_points = 100) {
+  # Generate random points inside the polygon
+  points <- st_sample(geom, size = n_points, type = "random")
+  return(points)
+}
+
+# Function to sample perimeter points from a polygon
+sample_perimeter_points <- function(geom, n_points = 100) {
+  # Cast to linestring and sample along the boundary
+  boundary <- st_cast(st_boundary(geom), "LINESTRING")
+  points <- st_line_sample(boundary, n = n_points)
+  # st_line_sample returns multipoint, convert to individual points
+  points <- st_cast(points, "POINT")
+  return(points)
+}
+
+# Calculate shape metrics for all protected areas
+pa_sample <- pa_sample %>%
+  mutate(
+    area_km2 = as.numeric(units::set_units(st_area(geometry), "km^2")),
+    perimeter_km = as.numeric(units::set_units(st_length(st_cast(geometry, "MULTILINESTRING")), "km"))
+  ) 
+
+pa_centroid = pa_sample %>% st_centroid() %>% st_coordinates() %>% as.data.frame()
+
+point_sample = sample_interior_points(pa_sample$geometry[1], n_points = 100)
+
+# Visualize sampled points and centroid for the first polygon
+p <- ggplot() + geom_sf(data = pa_sample[1,], fill = "lightgreen", color = "darkgreen") +
+  geom_sf(data = point_sample, color = "red", size = 2) +
+  geom_point(data = as.data.frame(pa_centroid[1,]), aes(x = X, y = Y), color = "blue", size = 3) +
+  theme_minimal()
+ggsave(file.path(figure_dir, "example_point_sampling.png"), p, width = 8, height = 6)
+
+# # P. 3 of Nina's appendix:
+# dist_matrix = units::set_units(st_distance(point_sample, point_sample), "km")
+# example_disconnection_index = sum(dist_matrix, na.rm = TRUE) / (nrow(dist_matrix) * (nrow(dist_matrix) - 1))
+
+# Process in chunks of 100. TODO: parallelize this.
+# AJ <- Have parallelized; looped # of chunks just to 2 to test if the code runs
+chunk_size <- 100
+n_total <- nrow(pa_sample)
+n_chunks <- ceiling(n_total / chunk_size)
+pa_sample_shapes <- list()
+
+for (i in 1:2) {
+  start_idx <- (i - 1) * chunk_size + 1
+  end_idx <- min(i * chunk_size, n_total)
+  
+  cat(sprintf("Processing chunk %d of %d (rows %d to %d)...\n", i, n_chunks, start_idx, end_idx))
+  
+  chunk_result <- pa_sample[start_idx:end_idx, ] %>%
+    rowwise() %>%
+    mutate(
+      # Sample points once
+      interior_pts = list(sample_interior_points(geometry, n_points = 100)),
+      perimeter_pts = list(sample_perimeter_points(geometry, n_points = 100)),
+      centroid = list(st_centroid(geometry)),
+      
+      # Disconnection: avg distance between interior point pairs
+      disconnection_index = {
+        if (length(interior_pts[[1]]) < 2) {
+          NA_real_
+        } else {
+          dist_matrix <- units::set_units(st_distance(interior_pts[[1]], interior_pts[[1]]), "km")
+          sum(dist_matrix, na.rm = TRUE) / (nrow(dist_matrix) * (nrow(dist_matrix) - 1))
+        }
+      },
+      
+      # Remoteness: avg distance from interior points to centroid
+      remoteness = {
+        if (length(interior_pts[[1]]) < 1) {
+          NA_real_
+        } else {
+          distances <- units::set_units(st_distance(interior_pts[[1]], centroid[[1]]), "km")
+          mean(as.numeric(distances), na.rm = TRUE)
+        }
+      },
+      
+      # Spin: avg of SQUARED distances from interior points to centroid
+      spin = {
+        if (length(interior_pts[[1]]) < 1) {
+          NA_real_
+        } else {
+          distances <- units::set_units(st_distance(interior_pts[[1]], centroid[[1]]), "km")
+          mean(as.numeric(distances)^2, na.rm = TRUE)
+        }
+      },
+      
+      # Range: max distance between two perimeter points
+      range_km = {
+        if (length(perimeter_pts[[1]]) < 2) {
+          NA_real_
+        } else {
+          dist_matrix <- units::set_units(st_distance(perimeter_pts[[1]], perimeter_pts[[1]]), "km")
+          max(as.numeric(dist_matrix), na.rm = TRUE)
+        }
+      }
+    ) %>%
+    ungroup() %>%
+    select(-interior_pts, -perimeter_pts, -centroid) %>%
+    mutate(
+      disconnection_index = as.numeric(disconnection_index),
+      remoteness = as.numeric(remoteness),
+      spin = as.numeric(spin),
+      range_km = as.numeric(range_km)
+    )
+  
+  pa_sample_shapes[[i]] <- chunk_result
+}
+
+# Combine all chunks
+pa_sample_shapes <- bind_rows(pa_sample_shapes)
+st_write(pa_sample_shapes, paste0(intermediate_data_dir, '/pa_sample_shapes.shp'), delete_dsn = TRUE)
+
+# Histogram: distribution of disconnection index
+disconnection_histogram <- pa_sample_disconnection %>%
+  st_drop_geometry() %>%
+  ggplot() +
+  geom_histogram(aes(x = disconnection_index), bins = 30, fill = "lightblue", color = "black") +
+  theme_minimal() +
+  scale_x_log10() +
+  labs(title = "Distribution of Disconnection Index", x = "Disconnection Index", y = "Count")
+ggsave(file.path(figure_dir, "disconnection_histogram.png"), p, width = 8, height = 6)
+
+print(disconnection_histogram)
+
+# How does disconnection index vary by legal found year?
+sample_summary = pa_sample_disconnection %>%
+  filter(legalFound > 0 & legalFound < 2030) %>%
+  st_drop_geometry() %>%
+  group_by(legalFound) %>%
+  summarise(mean_disconnection = mean(disconnection_index, na.rm = TRUE),
+            area_wt_mean_disconnection = wtd.mean(disconnection_index, area_km2, na.rm = TRUE),
+            n = n())
+
+p <- pa_sample_disconnection %>%
+  st_drop_geometry() %>%
+  filter(!is.na(disconnection_index) & disconnection_index > 0) %>%
+  ggplot() +
+  geom_histogram(aes(x = disconnection_index), bins = 30, fill = "lightblue", color = "black") +
+  theme_minimal() +
+  scale_x_log10() +
+  labs(title = "Distribution of Disconnection Index", x = "Disconnection Index (km, log scale)", y = "Count")
+
+print(p)
+
+# What is the trend in disconnection index over time, residualizing on area?
+
+trend_test = feols(sw(log(disconnection_index), disconnection_rescaled) ~ legalFound + log(area_km2) | csw0(cddaCountr), data = pa_sample_disconnection %>% 
+                     st_drop_geometry() %>% filter(legalFound > 0 & legalFound < 2030) %>%
+                     mutate(disconnection_rescaled = disconnection_index / sd(disconnection_index, na.rm = TRUE))) 
+
+etable(
+  trend_test,
+  style.tex = style.tex("aer"),
+  tex = TRUE,
+  dict = c("legalFound" = "Legal Found Year",
+           "log(area_km2)" = "Log Area (km^2)",
+           "cddaCountr" = "Country",
+           "disconnection_rescaled" = "Disconnection Index Std. Dev.",
+           "log(disconnection_index)" = "Log Disconnection Index"),
+  fitstat = c("n", "r2", "my"),
+  digits = 4,
+  file = file.path(figure_dir, "trend_test_table.tex")
+)
+
+pa_sample_disconnection$countryname <- countrycode(pa_sample_disconnection$cddaCountr, origin = 'eurostat', destination = 'country.name')
+
+# Country-specific trends: allow legalFound effect to vary by country
+country_trends = feols(disconnection_index ~ i(countryname, legalFound) + log(area_km2) | countryname,
+                       data = pa_sample_disconnection %>%
+                         st_drop_geometry() %>%
+                         filter(legalFound > 0 & legalFound < 2030))
+
+# Extract country-specific trend coefficients
+country_trend_coefs <- data.frame(
+  countryname = gsub("countryname::", "", gsub(":legalFound", "",
+                                               names(coef(country_trends))[grepl("countryname.*legalFound", names(coef(country_trends)))])),
+  trend = coef(country_trends)[grepl("countryname.*legalFound", names(coef(country_trends)))]
+)
+
+# Plot country-specific trends
+p <- country_trend_coefs %>%
+  ggplot() +
+  geom_col(aes(x = reorder(countryname, trend), y = trend), fill = "lightblue", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Country-Specific Trends in Disconnection Over Time",
+       x = "Country",
+       y = "Trend Coefficient (Change in Disconnection per Year)")
+ggsave(file.path(figure_dir, "country_trends.png"), p, width = 10, height = 8)
+
+print(p)
+
+# Which countries have the most disconnected protected areas on average?
+pa_sample_disconnection$countryname = countrycode(pa_sample_disconnection$cddaCountr, origin = 'eurostat', destination = 'country.name')
+country_summary = pa_sample_disconnection %>%
+  st_drop_geometry() %>%
+  group_by(countryname) %>%
+  summarise(mean_disconnection = mean(disconnection_index, na.rm = TRUE),
+            area_wt_mean_disconnection = wtd.mean(disconnection_index, area_km2, na.rm = TRUE),
+            n = n()) %>%
+  arrange(desc(mean_disconnection))
+
+p <- country_summary %>%
+  ggplot() +
+  geom_col(aes(x = reorder(countryname, mean_disconnection), y = mean_disconnection), fill = "lightblue", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Mean Disconnection Index by Country", x = "Country", y = "Mean Disconnection Index")
+ggsave(file.path(figure_dir, "disconnection_by_country.png"), p, width = 10, height = 8)
+
+print(p)
+
+
+area_residualized_country_ranking = feols(disconnection_index ~ i(countryname) + log(area_km2) - 1, data = pa_sample_disconnection %>%
+                                            st_drop_geometry() %>% filter(legalFound > 0 & legalFound < 2030) )
+
+# Extract country coefficients (residualized disconnection)
+country_coefs <- data.frame(
+  countryname = gsub("countryname::", "", names(coef(area_residualized_country_ranking))[grepl("countryname", names(coef(area_residualized_country_ranking)))]),
+  residualized_disconnection = coef(area_residualized_country_ranking)[grepl("countryname", names(coef(area_residualized_country_ranking)))]
+)
+
+# Plot residualized disconnection by country
+p <- country_coefs %>%
+  ggplot() +
+  geom_col(aes(x = reorder(countryname, residualized_disconnection), y = residualized_disconnection), fill = "lightblue", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Area-Residualized Disconnection Index by Country", x = "Country", y = "Residualized Disconnection Index")
+ggsave(file.path(figure_dir, "residualized_disconnection_by_country.png"), p, width = 10, height = 8)
+
+print(p)
+
+# Decomposition: merge mean disconnection with residualized disconnection
+decomposition_data <- country_summary %>%
+  left_join(country_coefs, by = "countryname") %>%
+  mutate(
+    area_effect = mean_disconnection - residualized_disconnection,
+    true_disconnection = residualized_disconnection
+  ) %>%
+  select(countryname, mean_disconnection, true_disconnection, area_effect)
+
+decomposition_data <- rbind(
+  decomposition_data %>% mutate(component = "true_disconnection", value = true_disconnection),
+  decomposition_data %>% mutate(component = "area_effect", value = area_effect)
+) %>% select(countryname, mean_disconnection, component, value)
+
+# Stacked bar chart showing decomposition
+p <- decomposition_data %>%
+  ggplot(aes(x = reorder(countryname, mean_disconnection), y = value, fill = component)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("true_disconnection" = "steelblue", "area_effect" = "coral"),
+                    labels = c("Area Effect", "Residualized Disconnection")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Disconnection Index Decomposition by Country",
+       x = "Country",
+       y = "Disconnection Index",
+       fill = "Component")
+ggsave(file.path(figure_dir, "disconnection_decomposition_by_country.png"), p, width = 10, height = 8) 
+
+print(p)

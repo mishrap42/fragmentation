@@ -115,7 +115,8 @@ for (i in 1:10) {  # Test with 2 first
     mutate(
       disconnection_index = as.numeric(sum(dist_matrix, na.rm = TRUE) / (nrow(dist_matrix) * (nrow(dist_matrix) - 1))),
       remoteness = as.numeric(mean(dist_to_centroid, na.rm = TRUE)),
-      spin = as.numeric(mean(dist_to_centroid^2, na.rm = TRUE))
+      spin = as.numeric(mean(dist_to_centroid^2, na.rm = TRUE)),
+      range_km = as.numeric(units::set_units(st_length(st_cast(st_convex_hull(geometry), "LINESTRING")), "km"))
     ) %>%
     select(-interior_pts, -dist_matrix, -dist_to_centroid) %>%
     ungroup()

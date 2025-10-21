@@ -126,7 +126,6 @@ for (i in 1:10) {  # Test with 2 first
 
 pa_sample_shapes <- bind_rows(pa_sample_shapes)
 
-stopifnot(0)
 st_write(pa_sample_shapes, paste0(intermediate_data_dir, '/pa_sample_shapes.shp'), delete_dsn = TRUE)
 
 View(pa_sample_shapes)
@@ -269,3 +268,261 @@ plots <- lapply(metrics, function(m) {
 })
 grid_plot <- grid.arrange(grobs = plots, ncol = 2)
 ggsave(file.path(figure_dir, "all_metrics_decomposition.png"), grid_plot, width = 14, height = 12)
+
+
+# Visualize the most disconnected region (residualized on area)
+disconnection_model <- lm(disconnection_index ~ poly(area_km2, 5), data = pa_sample_shapes %>% st_drop_geometry())
+pa_sample_shapes$disconnection_residual <- residuals(disconnection_model)
+
+most_disconnected_idx <- which.max(pa_sample_shapes$disconnection_residual)
+most_disconnected <- pa_sample_shapes[most_disconnected_idx, ]
+most_disconnected_pts <- sample_interior_points(most_disconnected$geometry, n_points = 100)
+most_disconnected_centroid <- st_centroid(most_disconnected$geometry)
+
+p_disconnected <- ggplot() +
+  geom_sf(data = most_disconnected, fill = "lightblue", color = "darkblue", linewidth = 1) +
+  geom_sf(data = most_disconnected_pts, color = "red", size = 1.5, alpha = 0.6) +
+  geom_sf(data = most_disconnected_centroid, color = "darkgreen", size = 4, shape = 17) +
+  theme_minimal() +
+  labs(title = sprintf("Most Disconnected Region (Residualized on Area)\nIndex: %.2f km | Residual: %.2f",
+                       most_disconnected$disconnection_index, most_disconnected$disconnection_residual),
+       subtitle = sprintf("Country: %s, Area: %.2f km²",
+                         most_disconnected$cddaCountr, most_disconnected$area_km2))
+ggsave(file.path(figure_dir, "most_disconnected_region.png"), p_disconnected, width = 10, height = 8)
+
+# Residualize all metrics on area for exemplar pairs analysis
+pa_sample_shapes_resid <- pa_sample_shapes %>% st_drop_geometry()
+
+metrics_to_residualize <- c("disconnection_index", "remoteness", "spin")
+for (metric in metrics_to_residualize) {
+  model <- lm(as.formula(paste(metric, "~ poly(area_km2, 5)")), data = pa_sample_shapes_resid)
+  pa_sample_shapes[[paste0(metric, "_resid")]] <- residuals(model)
+}
+
+# Find exemplar pairs: regions with different disconnection but same other metrics
+find_exemplar_pair <- function(data, metric_name, tolerance = 0.1) {
+  # For each pair of regions, check if they match on the metric but differ in disconnection
+  metric_col <- data[[paste0(metric_name, "_resid")]]
+  disc_col <- data$disconnection_index_resid
+
+  best_pair <- NULL
+  best_disc_diff <- 0
+
+  for (i in 1:(nrow(data)-1)) {
+    for (j in (i+1):nrow(data)) {
+      metric_diff <- abs(metric_col[i] - metric_col[j]) / (sd(metric_col, na.rm = TRUE) + 1e-10)
+      disc_diff <- abs(disc_col[i] - disc_col[j])
+
+      if (metric_diff < tolerance && disc_diff > best_disc_diff) {
+        best_disc_diff <- disc_diff
+        best_pair <- c(i, j)
+      }
+    }
+  }
+
+  return(best_pair)
+}
+
+# Find pairs for each metric
+cat("\n=== SEARCHING FOR EXEMPLAR PAIRS (RESIDUALIZED ON AREA) ===\n")
+
+metrics_to_check <- c("remoteness", "spin")
+exemplar_pairs <- list()
+
+for (metric in metrics_to_check) {
+  cat(sprintf("\nSearching for pair with same %s but different disconnection...\n", metric))
+  pair <- find_exemplar_pair(pa_sample_shapes, metric, tolerance = 0.1)
+
+  if (!is.null(pair)) {
+    i1 <- pair[1]
+    i2 <- pair[2]
+    cat(sprintf("  Found pair: rows %d and %d\n", i1, i2))
+    cat(sprintf("    %s (raw): %.3f vs %.3f\n",
+                metric,
+                pa_sample_shapes[[metric]][i1],
+                pa_sample_shapes[[metric]][i2]))
+    cat(sprintf("    %s (resid): %.3f vs %.3f\n",
+                metric,
+                pa_sample_shapes[[paste0(metric, "_resid")]][i1],
+                pa_sample_shapes[[paste0(metric, "_resid")]][i2]))
+    cat(sprintf("    disconnection (raw): %.3f vs %.3f\n",
+                pa_sample_shapes$disconnection_index[i1],
+                pa_sample_shapes$disconnection_index[i2]))
+    cat(sprintf("    disconnection (resid): %.3f vs %.3f (diff: %.3f)\n",
+                pa_sample_shapes$disconnection_index_resid[i1],
+                pa_sample_shapes$disconnection_index_resid[i2],
+                abs(pa_sample_shapes$disconnection_index_resid[i1] - pa_sample_shapes$disconnection_index_resid[i2])))
+    exemplar_pairs[[metric]] <- pair
+  } else {
+    cat(sprintf("  No suitable pair found for %s\n", metric))
+  }
+}
+
+# Visualize exemplar pairs
+for (metric in names(exemplar_pairs)) {
+  pair <- exemplar_pairs[[metric]]
+
+  regions <- pa_sample_shapes[pair, ]
+
+  plots_list <- list()
+  for (i in 1:2) {
+    region <- regions[i, ]
+    pts <- sample_interior_points(region$geometry, n_points = 100)
+    centroid <- st_centroid(region$geometry)
+
+    p <- ggplot() +
+      geom_sf(data = region, fill = "lightblue", color = "darkblue", linewidth = 1) +
+      geom_sf(data = pts, color = "red", size = 1, alpha = 0.5) +
+      geom_sf(data = centroid, color = "darkgreen", size = 3, shape = 17) +
+      theme_minimal() +
+      labs(title = sprintf("Region %d: Disconnection (resid) = %.2f", i, region[[paste0("disconnection_index_resid")]]),
+           subtitle = sprintf("%s (resid) = %.2f | Area = %.1f km²", metric, region[[paste0(metric, "_resid")]], region$area_km2))
+
+    plots_list[[i]] <- p
+  }
+
+  combined <- grid.arrange(grobs = plots_list, ncol = 2,
+                          top = sprintf("Same %s, Different Disconnection", toupper(metric)))
+  ggsave(file.path(figure_dir, sprintf("exemplar_pair_%s.png", metric)),
+         combined, width = 16, height = 8)
+}
+
+# Try to find a triple match (all 3 metrics similar but different disconnection)
+cat("\n=== SEARCHING FOR TRIPLE MATCH (same remoteness & spin, residualized) ===\n")
+best_triple_pair <- NULL
+best_triple_disc_diff <- 0
+
+remoteness_sd <- sd(pa_sample_shapes$remoteness_resid, na.rm = TRUE)
+spin_sd <- sd(pa_sample_shapes$spin_resid, na.rm = TRUE)
+
+for (i in 1:(nrow(pa_sample_shapes)-1)) {
+  for (j in (i+1):nrow(pa_sample_shapes)) {
+    remoteness_match <- abs(pa_sample_shapes$remoteness_resid[i] -
+      pa_sample_shapes$remoteness_resid[j]) / remoteness_sd < 0.15
+    spin_match <- abs(pa_sample_shapes$spin_resid[i] -
+      pa_sample_shapes$spin_resid[j]) / spin_sd < 0.15
+
+    disc_diff <- abs(pa_sample_shapes$disconnection_index_resid[i] -
+      pa_sample_shapes$disconnection_index_resid[j])
+
+    if (remoteness_match && spin_match && disc_diff > best_triple_disc_diff) {
+      best_triple_disc_diff <- disc_diff
+      best_triple_pair <- c(i, j)
+    }
+  }
+}
+
+if (!is.null(best_triple_pair)) {
+  i1 <- best_triple_pair[1]
+  i2 <- best_triple_pair[2]
+  cat(sprintf("Found triple match: rows %d and %d\n", i1, i2))
+  cat(sprintf("  remoteness (raw): %.3f vs %.3f\n",
+              pa_sample_shapes$remoteness[i1], pa_sample_shapes$remoteness[i2]))
+  cat(sprintf("  remoteness (resid): %.3f vs %.3f\n",
+              pa_sample_shapes$remoteness_resid[i1],
+              pa_sample_shapes$remoteness_resid[i2]))
+  cat(sprintf("  spin (raw): %.3f vs %.3f\n",
+              pa_sample_shapes$spin[i1], pa_sample_shapes$spin[i2]))
+  cat(sprintf("  spin (resid): %.3f vs %.3f\n",
+              pa_sample_shapes$spin_resid[i1], pa_sample_shapes$spin_resid[i2]))
+  cat(sprintf("  disconnection (raw): %.3f vs %.3f\n",
+              pa_sample_shapes$disconnection_index[i1],
+              pa_sample_shapes$disconnection_index[i2]))
+  cat(sprintf("  disconnection (resid): %.3f vs %.3f (diff: %.3f)\n",
+              pa_sample_shapes$disconnection_index_resid[i1],
+              pa_sample_shapes$disconnection_index_resid[i2],
+              best_triple_disc_diff))
+
+  regions <- pa_sample_shapes[best_triple_pair, ]
+  plots_list <- list()
+  for (i in 1:2) {
+    region <- regions[i, ]
+    pts <- sample_interior_points(region$geometry, n_points = 100)
+    centroid <- st_centroid(region$geometry)
+
+    p <- ggplot() +
+      geom_sf(data = region, fill = "lightcoral", color = "darkred",
+              linewidth = 1) +
+      geom_sf(data = pts, color = "blue", size = 1, alpha = 0.5) +
+      geom_sf(data = centroid, color = "darkgreen", size = 3, shape = 17) +
+      theme_minimal() +
+      labs(title = sprintf("Region %d: Disconnection (resid) = %.2f",
+                           i, region$disconnection_index_resid),
+           subtitle = sprintf("Remoteness (resid)=%.2f | Spin (resid)=%.2f",
+                            region$remoteness_resid, region$spin_resid))
+
+    plots_list[[i]] <- p
+  }
+
+  combined <- grid.arrange(grobs = plots_list, ncol = 2,
+                          top = "Same Remoteness & Spin (Resid), Different Disconnection")
+  ggsave(file.path(figure_dir, "exemplar_pair_triple.png"), combined,
+         width = 16, height = 8)
+} else {
+  cat("No triple match found with current tolerance\n")
+}
+
+# Visualize distribution of disconnection (residualized) at key quantiles
+cat("\n=== VISUALIZING DISCONNECTION DISTRIBUTION ===\n")
+quantiles <- c(0, 0.25, 0.5, 0.75, 0.9, 1)
+quantile_values <- quantile(pa_sample_shapes$disconnection_index_resid, probs = quantiles, na.rm = TRUE)
+quantile_labels <- c("Min", "25th", "50th", "75th", "90th", "Max")
+
+cat("Disconnection (residualized) quantiles:\n")
+for (i in 1:length(quantiles)) {
+  cat(sprintf("  %s: %.3f\n", quantile_labels[i], quantile_values[i]))
+}
+
+# Find regions closest to each quantile
+quantile_plots <- list()
+for (i in 1:length(quantiles)) {
+  # Find closest region to this quantile
+  idx <- which.min(abs(pa_sample_shapes$disconnection_index_resid - quantile_values[i]))
+  region <- pa_sample_shapes[idx, ]
+
+  pts <- sample_interior_points(region$geometry, n_points = 100)
+  centroid <- st_centroid(region$geometry)
+
+  p <- ggplot() +
+    geom_sf(data = region, fill = "lightblue", color = "darkblue", linewidth = 0.8) +
+    geom_sf(data = pts, color = "red", size = 0.8, alpha = 0.5) +
+    geom_sf(data = centroid, color = "darkgreen", size = 2, shape = 17) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10),
+          plot.subtitle = element_text(size = 8)) +
+    labs(title = sprintf("%s (%.2f)", quantile_labels[i], region$disconnection_index_resid),
+         subtitle = sprintf("Raw: %.2f km | Area: %.1f km²",
+                           region$disconnection_index, region$area_km2))
+
+  quantile_plots[[i]] <- p
+}
+
+combined_quantiles <- grid.arrange(grobs = quantile_plots, ncol = 3,
+                                  top = "Disconnection Index (Residualized) Distribution")
+ggsave(file.path(figure_dir, "disconnection_quantiles.png"), combined_quantiles,
+       width = 18, height = 12)
+
+
+bunch_test_dir = file.path(figure_dir, 'weird_bunching')
+if (!dir.exists(bunch_test_dir)) dir.create(bunch_test_dir, recursive = TRUE)
+weird_bunching = pa_sample_shapes %>% filter(abs(disconnection_index - 0.01) < 0.001)
+for (i in 1:nrow(weird_bunching)) {
+  # Find closest region to this quantile
+  region <- weird_bunching[i, ]
+
+  pts <- sample_interior_points(region$geometry, n_points = 100)
+  centroid <- st_centroid(region$geometry)
+
+  p <- ggplot() +
+    geom_sf(data = region, fill = "lightblue", color = "darkblue", linewidth = 0.8) +
+    geom_sf(data = pts, color = "red", size = 0.8, alpha = 0.5) +
+    geom_sf(data = centroid, color = "darkgreen", size = 2, shape = 17) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10),
+          plot.subtitle = element_text(size = 8)) +
+    labs(title =  sprintf("Name %s | Country: %s | Area: %.1f km²",
+                           region$siteName, region$cddaCountr, region$area_km2))
+
+  ggsave(file.path(bunch_test_dir, sprintf("weird_bunching_region_%d.png", i)), p,
+         width = 6, height = 5)
+}

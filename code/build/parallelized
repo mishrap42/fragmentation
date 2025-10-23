@@ -520,7 +520,7 @@ for (i in 1:nrow(weird_bunching)) {
     theme_minimal() +
     theme(plot.title = element_text(size = 10),
           plot.subtitle = element_text(size = 8)) +
-    labs(title =  sprintf("Name %s | Country: %s | Area: %.1f km²",
+    labs(title =  sprintf("Name %s | Country: %s | Area: %.1e km²",
                            region$siteName, region$cddaCountr, region$area_km2))
 
   ggsave(file.path(bunch_test_dir, sprintf("weird_bunching_region_%d.png", i)), p,

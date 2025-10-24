@@ -2,6 +2,7 @@ library(here)        # Manage file paths relative to project root
 here::i_am("code/build/1_calculate_shapes.R")
 library(sf)          # Spatial data handling (reading shapefiles, geometric operations)
 library(dplyr)       # Data manipulation (filtering, grouping, summarizing)
+library(data.table)  # Efficient data handling and writing
 
 set.seed(42)
 # This stores your repository path as a function "here()"
@@ -57,35 +58,61 @@ sample_interior_points <- function(geom, n_points = 100) {
 chunk_size <- 100
 n_total <- nrow(pa)
 n_chunks <- ceiling(n_total / chunk_size)
-pa_shapes <- list()
 
-start_idx <- (i - 1) * chunk_size + 1
-end_idx <- min(i * chunk_size, n_total)
+if (i <= n_chunks) {
+  pa_shapes <- list()
 
-cat(sprintf("Processing chunk %d of %d (rows %d to %d)...\n", i, n_chunks, start_idx, end_idx))
+  start_idx <- (i - 1) * chunk_size + 1
+  end_idx <- min(i * chunk_size, n_total)
 
-chunk = pa[start_idx:end_idx, ]
-chunk_result <- chunk %>%
-  rowwise() %>%
-  mutate(
-    interior_pts = list(sample_interior_points(geometry, n_points = 100))
-  ) %>%
-  mutate(
-    dist_matrix = list(units::set_units(st_distance(interior_pts, interior_pts), "km")),
-    dist_to_centroid = list(units::set_units(st_distance(interior_pts, st_centroid(geometry)), "km"))
-  ) %>%
-  mutate(
-    disconnection_index = as.numeric(sum(dist_matrix, na.rm = TRUE) / (nrow(dist_matrix) * (nrow(dist_matrix) - 1))),
-    remoteness = as.numeric(mean(dist_to_centroid, na.rm = TRUE)),
-    spin = as.numeric(mean(dist_to_centroid^2, na.rm = TRUE)),
-    range_km = as.numeric(units::set_units(st_length(st_cast(st_convex_hull(geometry), "LINESTRING")), "km"))
-  ) %>%
-  select(-interior_pts, -dist_matrix, -dist_to_centroid) %>%
-  ungroup()
+  cat(sprintf("Processing chunk %d of %d (rows %d to %d)...\n", i, n_chunks, start_idx, end_idx))
 
-pa_shapes[[i]] <- chunk_result
+  chunk = pa[start_idx:end_idx, ]
+  chunk_result <- chunk %>%
+    rowwise() %>%
+    mutate(
+      interior_pts = list(sample_interior_points(geometry, n_points = 100))
+    ) %>%
+    mutate(
+      dist_matrix = list(units::set_units(st_distance(interior_pts, interior_pts), "km")),
+      dist_to_centroid = list(units::set_units(st_distance(interior_pts, st_centroid(geometry)), "km"))
+    ) %>%
+    mutate(
+      disconnection_index = as.numeric(sum(dist_matrix, na.rm = TRUE) / (nrow(dist_matrix) * (nrow(dist_matrix) - 1))),
+      remoteness = as.numeric(mean(dist_to_centroid, na.rm = TRUE)),
+      spin = as.numeric(mean(dist_to_centroid^2, na.rm = TRUE)),
+      range_km = as.numeric(units::set_units(st_length(st_cast(st_convex_hull(geometry), "LINESTRING")), "km"))
+    ) %>%
+    select(-interior_pts, -dist_matrix, -dist_to_centroid) %>%
+    ungroup()
 
+  pa_shapes[[i]] <- chunk_result
 
-pa_shapes <- bind_rows(pa_shapes)
+  # Regular processing: save individual chunk
+  pa_shapes <- bind_rows(pa_shapes)
+  st_write(pa_shapes, file.path(intermediate_data_dir, paste0('pa_', i, '.shp')), delete_dsn = TRUE)
+  cat(sprintf("Chunk %d saved successfully.\n", i))
+} else {
+  # Consolidation job: combine all chunks
+  cat("Running consolidation job: combining all chunks...\n")
 
-st_write(pa_shapes, file.path(intermediate_data_dir, paste0('pa_', i, '.shp')), delete_dsn = TRUE)
+  all_chunks <- list()
+  for (chunk_id in 1:n_chunks) {
+    chunk_file <- file.path(intermediate_data_dir, paste0('pa_', chunk_id, '.shp'))
+    if (file.exists(chunk_file)) {
+      all_chunks[[chunk_id]] <- setDT(st_read(chunk_file, quiet = TRUE) %>% st_drop_geometry())
+    } else {
+      warning(sprintf("Chunk %d not found at %s\n", chunk_id, chunk_file))
+    }
+  }
+
+  # Combine all chunks into single dataset
+  pa_complete <- bind_rows(all_chunks)
+
+  # Save consolidated dataset
+  output_file <- file.path(intermediate_data_dir, 'pa_shapes_complete.gz')
+  fwrite(pa_complete, output_file)
+
+  cat(sprintf("Consolidation complete: %d protected areas saved to %s\n",
+              nrow(pa_complete), output_file))
+}

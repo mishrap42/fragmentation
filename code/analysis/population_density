@@ -1,0 +1,309 @@
+library(here)        # Manage file paths relative to project root
+library(sf)          # Spatial data handling (reading shapefiles, geometric operations)
+library(ggplot2)     # Data visualization and plotting
+library(dplyr)       # Data manipulation (filtering, grouping, summarizing)
+library(gridExtra)   # Arrange multiple plots side-by-side
+library(readxl)      # Read Excel files
+library(binsreg)     # Binned regression plots
+library(lubridate)   # Date/time manipulation
+library(Hmisc)       # Miscellaneous data analysis functions
+library(fixest)      # Fast fixed-effects regressions
+library(countrycode) # Convert country codes/names
+library(terra)
+library(exactextractr)
+library(leafem)
+install.packages("rmapshaper")
+
+
+
+test <- rast("/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/Data/raw/raster/populationdensity/gpw-v4-population-density-rev11_2010_30_sec_tif/gpw_v4_population_density_rev11_2000_30_sec.tif")
+plot(test)
+
+
+pop_raster_path <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/Data/raw/raster/populationdensity/gpw-v4-population-density-rev11_2010_30_sec_tif/gpw_v4_population_density_rev11_2010_30_sec.tif"
+
+cat("Loading population density raster...\n")
+pop <- rast(pop_raster_path)
+
+cat("Raster CRS:\n")
+print(crs(pop))
+
+
+# --------------------------------
+# REPROJECT PA SHAPES TO RASTER CRS
+# --------------------------------
+cat("Reprojecting PA polygons to raster CRS...\n")
+pa_sample_proj <- st_transform(pa_sample, crs(pop))
+
+# terra wants SpatVector for masking/bounding ops
+pa_vect <- vect(pa_sample_proj)
+
+
+# ============================
+# POPULATION DENSITY EXTRACTION
+# ============================
+
+cat("Extracting population density (mean, sd)... this may take a few minutes...\n")
+
+# EXACT extraction (area-weighted)
+pa_sample_proj$pop_mean <- exact_extract(pop, pa_sample_proj, "mean")
+pa_sample_proj$pop_sd   <- exact_extract(pop, pa_sample_proj, "stdev")
+pa_sample_proj$pop_sum  <- exact_extract(pop, pa_sample_proj, "sum")
+
+cat("Done. Summary:\n")
+summary(pa_sample_proj$pop_mean)
+
+# Save enriched PA sample
+st_write(
+  pa_sample_proj,
+  file.path(intermediate_data_dir, "pa_sample_with_popdensity.shp"),
+  delete_dsn = TRUE
+)
+
+cat("Saved: pa_sample_with_popdensity.shp\n")
+
+
+# ============================
+# PLOT POPULATION DENSITY HISTOGRAM
+# ============================
+
+p_pop <- pa_sample_proj %>%
+  st_drop_geometry() %>%
+  ggplot(aes(x = pop_mean)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.75) +
+  theme_minimal() +
+  labs(
+    title = "Population Density Within Protected Areas",
+    x = "Mean Population Density (people per km²)",
+    y = "Count"
+  )
+
+ggsave(file.path(figure_dir, "population_density_histogram.png"),
+       p_pop, width = 8, height = 6)
+
+print(p_pop)
+
+
+# ============================
+# OPTIONAL: VISUALIZE 1 EXAMPLE
+# ============================
+
+example_i <- 10
+pa_i <- pa_vect[example_i]
+
+# Clip raster to PA
+pop_clip <- crop(pop, pa_i) |> mask(pa_i)
+
+# Convert to a raster object that leaflet can read
+pop_clip_r <- raster::raster(pop_clip)
+
+leaflet() %>%
+  addTiles() %>%
+  addRasterImage(pop_clip_r, colors = colorNumeric("viridis", values(pop_clip_r),
+                                                   na.color = "transparent"), opacity = 0.8) %>%
+  addPolygons(data = st_as_sf(pa_i), color = "red", weight = 2, fillOpacity = 0) %>%
+  addLegend(pal = colorNumeric("viridis", values(pop_clip_r), na.color="transparent"),
+            values = values(pop_clip_r),
+            title = "Population Density")
+
+
+# 1. Project PA polygons to raster CRS
+pa_proj <- st_transform(pa_sample, crs(pop))
+
+# 2. Extract population density inside each protected area
+pa_proj$pop_mean <- exact_extract(pop, pa_proj, "mean")
+pa_proj$pop_sum  <- exact_extract(pop, pa_proj, "sum")
+pa_proj$pop_sd   <- exact_extract(pop, pa_proj, "stdev")
+
+# 3. Build clean dataframe
+pa_pop_df <- pa_proj %>%
+  st_drop_geometry() %>%
+  select(
+    cddaCountr,
+    legalFound,
+    area_km2,
+    pop_mean,
+    pop_sum,
+    pop_sd
+  )
+View(pa_pop_df)
+# 4. Save dataset
+write.csv(
+  pa_pop_df,
+  file.path(intermediate_data_dir, "pa_population_data.csv"),
+  row.names = FALSE
+)
+cat("Saved pa_population_data.csv\n")
+
+# ======== VISUALIZATIONS ========
+
+# A. Histogram of population density
+p_hist <- ggplot(pa_pop_df, aes(x = pop_mean)) +
+  geom_histogram(bins = 80, fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Population Density Inside Protected Areas",
+    x = "Mean Pop Density (people/km²)",
+    y = "Count"
+  ) +
+  coord_cartesian(xlim = c(0, 4000))   # <— HERE
+
+print(p_hist)
+
+# Make sure pop_mean exists in pa_sample_proj
+stopifnot("pop_mean" %in% colnames(pa_sample_proj))
+
+# Create a color palette based on population density
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = pa_sample_proj$pop_mean,
+  na.color = "transparent"
+)
+
+
+p_country_avg <- ggplot(country_avg, aes(x = reorder(cddaCountr, avg_pop), y = avg_pop)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Average Population Density Inside PAs by Country",
+    x = "Country",
+    y = "Average Pop Density"
+  )
+
+print(p_country_avg)
+
+
+# -------------------------------------------------------
+# 0. Load your population raster
+# -------------------------------------------------------
+pop_raster_path <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/Data/raw/raster/populationdensity/gpw-v4-population-density-rev11_2010_30_sec_tif/gpw_v4_population_density_rev11_2010_30_sec.tif"
+pop <- rast(pop_raster_path)
+
+# -------------------------------------------------------
+# 1. Fix invalid geometries
+# -------------------------------------------------------
+pa_fixed <- st_make_valid(pa_sample_proj)
+pa_fixed <- st_collection_extract(pa_fixed, "POLYGON", warn = FALSE)
+
+# -------------------------------------------------------
+# 2. Sample 200 PAs
+# -------------------------------------------------------
+set.seed(123)
+pa_200 <- pa_fixed %>% slice_sample(n = 200)
+
+# -------------------------------------------------------
+# 3. Extract population density from raster
+# -------------------------------------------------------
+pa_200$pop_mean <- exact_extract(pop, pa_200, "mean")
+pa_200$pop_sd   <- exact_extract(pop, pa_200, "stdev")
+pa_200$pop_sum  <- exact_extract(pop, pa_200, "sum")
+
+# -------------------------------------------------------
+# 4. Reproject for leaflet
+# -------------------------------------------------------
+pa_200_wgs <- st_transform(pa_200, 4326)
+
+# -------------------------------------------------------
+# 5. Color palette (base R — NO viridis)
+# -------------------------------------------------------
+pal <- colorNumeric(
+  palette = "YlOrRd",   # built-in yellow→orange→red palette
+  domain  = pa_200_wgs$pop_mean,
+  na.color = "transparent"
+)
+
+# -------------------------------------------------------
+# 6. Leaflet map
+# -------------------------------------------------------
+leaflet(pa_200_wgs) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal(pop_mean),
+    fillOpacity = 0.7,
+    color = "darkgreen",
+    weight = 0.4,
+    popup = ~paste0(
+      "<b>Country:</b> ", cddaCountr, "<br>",
+      "<b>Founding Year:</b> ", legalFound, "<br>",
+      "<b>Mean Pop Density:</b> ", round(pop_mean, 2), " per km²"
+    ),
+    highlightOptions = highlightOptions(
+      color = "black",
+      weight = 2,
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = pa_200_wgs$pop_mean,
+    title = "Population Density (people/km²)",
+    position = "bottomright"
+  )
+
+
+
+# -------------------------------------------------------
+# 0. Load population raster
+# -------------------------------------------------------
+pop_raster_path <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/Data/raw/raster/populationdensity/gpw-v4-population-density-rev11_2010_30_sec_tif/gpw_v4_population_density_rev11_2010_30_sec.tif"
+pop <- rast(pop_raster_path)
+
+# -------------------------------------------------------
+# 1. Fix geometries
+# -------------------------------------------------------
+pa_fixed <- st_make_valid(pa_sample_proj)
+pa_fixed <- st_collection_extract(pa_fixed, "POLYGON", warn = FALSE)
+
+# -------------------------------------------------------
+# 2. Extract population density for ALL protected areas
+# -------------------------------------------------------
+pa_fixed$pop_mean <- exact_extract(pop, pa_fixed, "mean")
+pa_fixed$pop_sd   <- exact_extract(pop, pa_fixed, "stdev")
+pa_fixed$pop_sum  <- exact_extract(pop, pa_fixed, "sum")
+
+# -------------------------------------------------------
+# 3. Reproject to WGS84 (required for leaflet)
+# -------------------------------------------------------
+pa_wgs <- st_transform(pa_fixed, 4326)
+
+# -------------------------------------------------------
+# 4. Build color palette (built-in “YlOrRd”, no viridis)
+# -------------------------------------------------------
+pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain = pa_wgs$pop_mean,
+  na.color = "transparent"
+)
+
+# -------------------------------------------------------
+# 5. Leaflet map with SATELLITE view
+# -------------------------------------------------------
+
+leaflet(pa_wgs) %>%
+  addProviderTiles("Esri.WorldImagery") %>%       # <—— SATELLITE BASEMAP
+  addPolygons(
+    fillColor = ~pal(pop_mean),
+    fillOpacity = 0.6,
+    color = "white",
+    weight = 0.3,
+    popup = ~paste0(
+      "<b>Country:</b> ", cddaCountr, "<br>",
+      "<b>Founding year:</b> ", legalFound, "<br>",
+      "<b>Mean Pop Density:</b> ", round(pop_mean, 2), " per km²<br>"
+    ),
+    highlightOptions = highlightOptions(
+      color = "yellow",
+      weight = 2,
+      fillOpacity = 0.8,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = pa_wgs$pop_mean,
+    title = "Population Density (people/km²)",
+    position = "bottomright"
+  )
+

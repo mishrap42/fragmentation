@@ -28,12 +28,12 @@ suppressMessages({
 # ==============================================================================
 
 # Project root (auto-detected via here package)
-project_root <- here()
+project_root <- here::i_am('code/build/BUILD_workspace.R')
 
 # Input data paths - UPDATE THESE TO YOUR ACTUAL DATA LOCATIONS
-tmf_path <- "/path/to/TMF/AnnualChange"           # TMF GeoTIFF tiles
-gadm_path <- "/path/to/GADM/gadm_410-levels.gpkg" # GADM country boundaries
-wdpa_path <- "/path/to/WDPA/WDPA_polygons.gpkg"   # WDPA protected areas
+tmf_path <- file.path(here(), 'Data', 'raw', 'TMF', 'AnnualChange')        # TMF GeoTIFF tiles
+gadm_path <- file.path(here(), 'Data', 'raw', 'GADM', 'gadm_410-levels.gpkg')  # GADM country boundaries
+wdpa_path <- file.path(here(), 'Data', 'raw', 'TMF', 'protected sites', 'protectedsites.shp')    # WDPA protected areas
 
 # Output paths (relative to project root)
 raw_data_path <- file.path(project_root, "Data", "raw")

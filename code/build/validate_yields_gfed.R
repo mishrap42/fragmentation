@@ -175,6 +175,13 @@ add_check("yields", "rows", "non-empty",
 
 PLOT_TOP_N_CROPS <- 12
 
+# Upper bound for a harvested-area fraction; see the bounds check below.
+MULTICROP_CEILING <- 4
+
+# Crop columns that are constant (almost always all-zero: crop absent from the
+# tropics). Collected during the loop and reported once.
+constant_cols <- character(0)
+
 always_plot <- intersect(c("cropland_frac", "pasture_frac", "cropshare_total"),
                          yield_cols)
 
@@ -214,16 +221,38 @@ for (col in yield_cols) {
     add_check("yields", col, "has non-NA values", FALSE, "all NA")
   } else {
     add_check("yields", col, "has non-NA values", TRUE, sprintf("%.1f%% non-NA", pct))
-    # A constant column means the raster read but carried no information.
-    add_check("yields", col, "non-degenerate (varies)",
-              length(unique(vv)) > 1,
-              sprintf("%d distinct values", length(unique(vv))))
-    # These are FRACTIONS of cell area - outside [0,1] means the wrong layer
-    # was picked up (e.g. HarvestedAreaHectares instead of Fraction).
+    # A constant column is a genuine bug for the land-use layers, which must vary
+    # across a global tropical grid. For an individual CROP it is expected: this
+    # grid is tropical moist forest and the 172-crop set is global, so carob,
+    # kiwi, chicory, peppermint and the fodder crops are legitimately absent
+    # everywhere. Counted and listed below rather than failed 25 times.
+    if (col %in% c("cropland_frac", "pasture_frac", "cropshare_total")) {
+      add_check("yields", col, "non-degenerate (varies)",
+                length(unique(vv)) > 1,
+                sprintf("%d distinct values", length(unique(vv))))
+    } else if (length(unique(vv)) <= 1) {
+      constant_cols <<- c(constant_cols, col)
+    }
+    # Harvested-area fractions of cell area. The upper bound is NOT 1: EarthStat
+    # counts a hectare once per harvest, so a double- or triple-cropped cell
+    # exceeds 1 for the individual crop too, not just for the total. The 2026-08-22
+    # run hit this on exactly the crops you would predict - rice 1.93, cotton 1.82,
+    # soybean 1.62, maize 1.58, sugarcane 1.44 - all real multi-cropping.
+    # MULTICROP_CEILING sits above any plausible harvest count and far below what
+    # a HarvestedAreaHectares mix-up would produce (a 5 km cell is ~2500 ha), which
+    # is the error this check actually exists to catch.
     if (col %in% frac_cols) {
-      add_check("yields", col, "bounded in [0,1]",
-                min(vv) >= -1e-9 && max(vv) <= 1 + 1e-9,
+      add_check("yields", col,
+                sprintf("bounded in [0,%g]", MULTICROP_CEILING),
+                min(vv) >= -1e-9 && max(vv) <= MULTICROP_CEILING + 1e-9,
                 sprintf("range [%.4f, %.4f]", min(vv), max(vv)))
+    }
+
+    # cropland_frac / pasture_frac are true land-cover shares with no harvest
+    # dimension, so they ARE bounded by 1.
+    if (col %in% c("cropland_frac", "pasture_frac")) {
+      add_check("yields", col, "land-cover share bounded in [0,1]",
+                max(vv) <= 1 + 1e-9, sprintf("max = %.4f", max(vv)))
     }
     # EarthStat YieldPerHectare is tons/ha. Single digits for most grains, but
     # the 172-crop set includes fresh-weight sugar and fodder crops (sugarcane,
@@ -260,6 +289,15 @@ for (col in yield_cols) {
 }
 
 yield_summary <- rbindlist(summary_rows)
+
+log_message(sprintf("Constant (all-zero) crop columns: %d of %d",
+                    length(constant_cols), length(yield_cols)))
+if (length(constant_cols) > 0) {
+  log_message(sprintf("  %s", paste(constant_cols, collapse = ", ")))
+}
+add_check("yields", "constant columns", "fewer than half the crop layers are all-zero",
+          length(constant_cols) < 0.5 * length(yield_cols),
+          sprintf("%d of %d constant", length(constant_cols), length(yield_cols)))
 
 # ==============================================================================
 # SECTION 1b: ASSEMBLED CROPLAND CROSS-SECTION (Stage 1b)

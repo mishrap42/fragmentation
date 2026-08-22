@@ -38,8 +38,27 @@ skip_if_exists(output_file, sprintf("sub-tile %d", sub_tile_id))
 # ==============================================================================
 
 # Check grid file exists
-grid_gpkg <- get_grid_filename(sub_tile_id, "gpkg")
+# A missing .gpkg is NOT necessarily a missing stage 0. Stage 0 writes an empty
+# .parquet and NO .gpkg for sub-tiles with no land (40 of 344 - open ocean).
+# stop()ing on those turns an expected state into a task failure, which is what
+# left TMF_CROP permanently PD with DependencyNeverSatisfied: afterok can never
+# be satisfied when 40 tasks "fail" by design.
+#
+# Distinguish the two cases by the .parquet: present means stage 0 ran and the
+# sub-tile is genuinely empty; absent means stage 0 really has not run.
+grid_gpkg    <- get_grid_filename(sub_tile_id, "gpkg")
+grid_parquet <- get_grid_filename(sub_tile_id, "parquet")
 if (!file.exists(grid_gpkg)) {
+  if (file.exists(grid_parquet)) {
+    log_message(sprintf(
+      "Sub-tile %d has no grid geometry (ocean; stage 0 wrote an empty grid). Creating empty output.",
+      sub_tile_id))
+    write_atomic(data.table(grid_id = character(0), year = integer(0),
+                            month = integer(0), burned_area = numeric(0)),
+                 output_file)
+    log_job_end(start_time)
+    quit(save = "no", status = 0)
+  }
   stop(sprintf("Grid file not found: %s\nRun Stage 0 first.", grid_gpkg))
 }
 

@@ -3,12 +3,16 @@
 # ==============================================================================
 # This script merges all pipeline outputs into the final panel dataset.
 #
-# Input: Grid metadata, TMF time series, classifications, WDPA data
-# Output: Data/build/final/TMF_1km_panel.parquet
+# Input: Grid metadata (includes WDPA), TMF time series, classifications
+# Output: Data/build/final/TMF_5km_panel.parquet
+#
+# Note: WDPA data is baked into grid cells at Stage 0 - each cell is either
+# fully protected or not (grid is cut on WDPA boundaries).
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
+here::i_am('code/build/6_assemble_final.R')
+source("code/build/BUILD_workspace.R")
 
 # Record start time
 start_time <- Sys.time()
@@ -16,19 +20,20 @@ start_time <- Sys.time()
 log_job_start("6_assemble_final.R", task_id = 1)
 
 # Check if output already exists
-output_file <- file.path(final_output_path, "TMF_1km_panel.parquet")
+output_file <- panel_final_file
 skip_if_exists(output_file, "final assembly")
 
 # ==============================================================================
-# LOAD ALL GRID METADATA
+# LOAD ALL GRID METADATA (from sub-tile files)
 # ==============================================================================
 
 log_message("Loading grid metadata...")
 
-grid_files <- sapply(1:N_TMF_TILES, function(t) get_grid_filename(t, "parquet"))
+# Get all sub-tile grid files
+grid_files <- sapply(1:N_SUB_TILES, function(s) get_grid_filename(s, "parquet"))
 files_exist <- file.exists(grid_files)
 
-log_message(sprintf("Found %d/%d grid files", sum(files_exist), length(grid_files)))
+log_message(sprintf("Found %d/%d sub-tile grid files", sum(files_exist), N_SUB_TILES))
 
 grid_list <- lapply(grid_files[files_exist], function(f) {
   dt <- read_parquet(f)
@@ -37,40 +42,66 @@ grid_list <- lapply(grid_files[files_exist], function(f) {
 })
 
 grid_all <- rbindlist(grid_list, fill = TRUE)
-log_message(sprintf("Total grid cells: %s",
-                    format(nrow(grid_all), big.mark = ",")))
+log_message(sprintf("Total grid cells: %s from %d sub-tiles",
+                    format(nrow(grid_all), big.mark = ","),
+                    sum(files_exist)))
 
 rm(grid_list)
 gc()
 
 # ==============================================================================
-# LOAD TMF TIME SERIES
+# LOAD TMF TIME SERIES (using Arrow dataset API for memory efficiency)
 # ==============================================================================
 
-log_message("Loading TMF time series...")
+log_message("Loading TMF time series from tile-level parquet files...")
 
-tmf_file <- file.path(consolidated_path, "tmf_all.parquet")
+# Use Arrow's dataset API to read directly from tile parquet files
+# This avoids the 2.1 billion row limit of rbindlist
+tile_files <- sapply(1:N_TMF_TILES, get_consolidated_tile_filename)
+files_exist <- file.exists(tile_files)
 
-if (!file.exists(tmf_file)) {
-  stop(sprintf("TMF consolidated file not found: %s. Run Stage 2b first.", tmf_file))
+log_message(sprintf("Found %d/%d consolidated tile files", sum(files_exist), N_TMF_TILES))
+
+if (sum(files_exist) == 0) {
+  stop("No consolidated tile files found. Run Stage 2a first.")
 }
 
-tmf_all <- read_parquet(tmf_file)
-setDT(tmf_all)
+# Open as Arrow dataset (lazy evaluation - doesn't load into memory yet)
+tmf_dataset <- arrow::open_dataset(tile_files[files_exist], format = "parquet")
 
-log_message(sprintf("TMF observations: %s",
-                    format(nrow(tmf_all), big.mark = ",")))
+log_message("Arrow dataset opened. Processing in chunks to reshape...")
 
-# Reshape to wide format for easier analysis
-log_message("Reshaping TMF to wide format...")
+# Process and reshape in chunks by tile to manage memory
+# Each tile produces a wide-format data.table
+tmf_wide_list <- lapply(which(files_exist), function(i) {
+  tile_file <- tile_files[i]
 
-tmf_wide <- dcast(tmf_all, grid_id + year ~ tmf_class,
-                  value.var = "fraction", fill = 0)
+  # Read single tile
+  tile_data <- arrow::read_parquet(tile_file)
+  setDT(tile_data)
+
+  if (nrow(tile_data) == 0) return(NULL)
+
+  # Reshape to wide format within the tile
+  tile_wide <- dcast(tile_data, grid_id + year ~ tmf_class,
+                     value.var = "fraction", fill = 0)
+
+  rm(tile_data)
+  return(tile_wide)
+})
+
+# Remove NULL entries
+tmf_wide_list <- tmf_wide_list[!sapply(tmf_wide_list, is.null)]
+
+log_message(sprintf("Processed %d tiles, combining...", length(tmf_wide_list)))
+
+# Combine wide-format tiles (much fewer rows than long format)
+tmf_wide <- rbindlist(tmf_wide_list, use.names = TRUE, fill = TRUE)
 
 log_message(sprintf("TMF wide format: %s cell-years",
                     format(nrow(tmf_wide), big.mark = ",")))
 
-rm(tmf_all)
+rm(tmf_wide_list)
 gc()
 
 # ==============================================================================
@@ -123,40 +154,86 @@ log_message(sprintf("Frontier classifications: %s cells (%s frontier)",
 rm(frontier_list)
 gc()
 
+# Note: WDPA data is already in grid_all from Stage 0 (grid cells are cut on WDPA boundaries)
+# Each cell has: is_protected, wdpa_pid, iucn_cat, desig_year, gov_type
+
 # ==============================================================================
-# LOAD WDPA DATA
+# YIELD / CROP-SHARE DATA IS *NOT* MERGED HERE
+# ==============================================================================
+# Stage 0c produces 345 EarthStat columns (172 yield_*, 172 cropshare_*,
+# cropland_frac / pasture_frac / cropshare_total). All of it is a year-2000
+# CROSS-SECTION. Merging it into this cell-year panel would replicate a
+# time-invariant object across 34 years - roughly 66.8M x 345 x 8 bytes, ~184 GB
+# uncompressed - to add exactly zero information per row.
+#
+# It is consolidated on the extraction side of the build, by Stage 1b
+# (1b_assemble_cropland.R), into
+#   Data/build/final/TMF_5km_cropland.parquet     (one row per grid_id)
+# and joined on grid_id at analysis time. 1b and this stage are independent:
+# neither waits on the other, and neither reads the other's output.
+#
+# The GAEZ-era yield_*200a_yld columns in any panel built before 2026-08-21 came
+# through this merge under the pre-EarthStat config; they are gone by design,
+# not by accident.
+
+# ==============================================================================
+# LOAD COVARIATE DATA (from Stage 5)
 # ==============================================================================
 
-log_message("Loading WDPA data...")
+log_message("Loading covariate data...")
 
-wdpa_file <- get_wdpa_filename(NULL)  # Consolidated
+covariate_files <- sapply(1:N_TMF_TILES, get_covariates_filename)
+files_exist <- file.exists(covariate_files)
 
-if (!file.exists(wdpa_file)) {
-  log_message("WDPA consolidated file not found, loading from tiles...")
+if (sum(files_exist) > 0) {
+  log_message(sprintf("Found %d/%d covariate files", sum(files_exist), N_TMF_TILES))
 
-  wdpa_files <- sapply(1:N_TMF_TILES, get_wdpa_filename)
-  files_exist <- file.exists(wdpa_files)
-
-  wdpa_list <- lapply(wdpa_files[files_exist], function(f) {
+  covariate_list <- lapply(covariate_files[files_exist], function(f) {
     dt <- read_parquet(f)
     setDT(dt)
     return(dt)
   })
 
-  wdpa_all <- rbindlist(wdpa_list, fill = TRUE)
-  wdpa_all <- unique(wdpa_all, by = "grid_id")
+  covariates_all <- rbindlist(covariate_list, fill = TRUE)
+  log_message(sprintf("Covariate data: %s cells, %d variables",
+                      format(nrow(covariates_all), big.mark = ","),
+                      ncol(covariates_all) - 1))
 
-  rm(wdpa_list)
+  rm(covariate_list)
+  gc()
 } else {
-  wdpa_all <- read_parquet(wdpa_file)
-  setDT(wdpa_all)
+  log_message("No covariate files found. Skipping covariate data.")
+  covariates_all <- NULL
 }
 
-log_message(sprintf("WDPA data: %s cells (%s protected)",
-                    format(nrow(wdpa_all), big.mark = ","),
-                    format(sum(wdpa_all$is_protected, na.rm = TRUE), big.mark = ",")))
+# ==============================================================================
+# LOAD GFED BURNED AREA DATA (from Stage 2b)
+# ==============================================================================
 
-gc()
+log_message("Loading GFED burned area data...")
+
+gfed_files <- sapply(1:N_TMF_TILES, get_gfed_consolidated_filename)
+files_exist <- file.exists(gfed_files)
+
+if (sum(files_exist) > 0) {
+  log_message(sprintf("Found %d/%d GFED tile files", sum(files_exist), N_TMF_TILES))
+
+  gfed_list <- lapply(gfed_files[files_exist], function(f) {
+    dt <- read_parquet(f)
+    setDT(dt)
+    return(dt)
+  })
+
+  gfed_all <- rbindlist(gfed_list, fill = TRUE)
+  log_message(sprintf("GFED data: %s cell-years",
+                      format(nrow(gfed_all), big.mark = ",")))
+
+  rm(gfed_list)
+  gc()
+} else {
+  log_message("No GFED files found. Skipping GFED data.")
+  gfed_all <- NULL
+}
 
 # ==============================================================================
 # MERGE CLASSIFICATIONS
@@ -164,9 +241,14 @@ gc()
 
 log_message("Merging grid metadata with classifications...")
 
-# Start with grid metadata
+# Start with grid metadata (includes WDPA and transport costs from Stage 0)
 panel_base <- grid_all[, .(grid_id, tile_id, country_iso3, country_name,
-                           centroid_lon, centroid_lat, area_km2)]
+                           centroid_lon, centroid_lat, area_km2,
+                           is_protected, wdpa_pid, iucn_cat, desig_year, gov_type,
+                           travel_time_cities, travel_time_ports)]
+
+# Fill NA protection status (shouldn't happen but just in case)
+panel_base[is.na(is_protected), is_protected := FALSE]
 
 # Add interior classification
 panel_base <- merge(
@@ -191,24 +273,26 @@ panel_base <- merge(
 # Fill NAs
 panel_base[is.na(is_frontier), is_frontier := FALSE]
 
-# Add WDPA data
-panel_base <- merge(
-  panel_base,
-  wdpa_all[, .(grid_id, is_protected, protected_frac,
-               wdpa_pid, iucn_cat, desig_year, gov_type)],
-  by = "grid_id",
-  all.x = TRUE
-)
+# Add covariate data if available
+if (!is.null(covariates_all)) {
+  log_message("Merging covariate data...")
+  panel_base <- merge(
+    panel_base,
+    covariates_all,
+    by = "grid_id",
+    all.x = TRUE
+  )
+  rm(covariates_all)
+  gc()
+}
 
-# Fill NAs
-panel_base[is.na(is_protected), is_protected := FALSE]
-panel_base[is.na(protected_frac), protected_frac := 0]
+# Note: WDPA data already included from grid (no separate merge needed)
 
 log_message(sprintf("Base panel: %s cells",
                     format(nrow(panel_base), big.mark = ",")))
 
 # Clean up
-rm(grid_all, interior_all, frontier_all, wdpa_all)
+rm(grid_all, interior_all, frontier_all)
 gc()
 
 # ==============================================================================
@@ -225,11 +309,37 @@ final_panel <- merge(
   all = TRUE  # Keep all cells and all TMF observations
 )
 
-log_message(sprintf("Final panel: %s observations",
+log_message(sprintf("Panel after TMF merge: %s observations",
                     format(nrow(final_panel), big.mark = ",")))
 
 # Clean up
 rm(panel_base, tmf_wide)
+gc()
+
+# Add GFED burned area data (time-varying, merges on grid_id + year)
+if (!is.null(gfed_all)) {
+  log_message("Merging GFED burned area data...")
+
+  final_panel <- merge(
+    final_panel,
+    gfed_all[, .(grid_id, year, burned_annual)],
+    by = c("grid_id", "year"),
+    all.x = TRUE
+  )
+
+  # Fill NA with 0 (no detected burning)
+  final_panel[is.na(burned_annual), burned_annual := 0]
+
+  log_message(sprintf("Cells with burns: %s",
+                      format(sum(final_panel$burned_annual > 0), big.mark = ",")))
+
+  rm(gfed_all)
+  gc()
+}
+
+log_message(sprintf("Final panel: %s observations",
+                    format(nrow(final_panel), big.mark = ",")))
+
 gc_verbose()
 
 # ==============================================================================
@@ -285,15 +395,12 @@ if (nrow(both_flags) > 0) {
                       nrow(both_flags)))
 }
 
-# Check 4: Protected fraction should be <= 1
-if ("protected_frac" %in% names(final_panel)) {
-  invalid_frac <- final_panel[protected_frac > 1]
-  if (nrow(invalid_frac) > 0) {
-    log_message(sprintf("WARNING: %d cells have protected_frac > 1, capping at 1",
-                        length(unique(invalid_frac$grid_id))))
-    final_panel[protected_frac > 1, protected_frac := 1]
-  }
-}
+# Check 4: Binary protection (cells are fully protected or not, cut on WDPA boundaries)
+n_protected <- sum(final_panel$is_protected, na.rm = TRUE)
+n_unique_protected <- length(unique(final_panel[is_protected == TRUE]$grid_id))
+log_message(sprintf("Protected observations: %s (%s unique cells)",
+                    format(n_protected, big.mark = ","),
+                    format(n_unique_protected, big.mark = ",")))
 
 # ==============================================================================
 # SUMMARY STATISTICS
@@ -325,18 +432,18 @@ for (i in seq_len(nrow(zone_dist))) {
                       format(zone_dist$n_observations[i], big.mark = ",")))
 }
 
-# Protection status
+# Protection status (cells are cut on WDPA boundaries, so each is fully protected or not)
 prot_dist <- final_panel[!is.na(year), .(
   n_cells = length(unique(grid_id)),
-  mean_protected_frac = mean(protected_frac, na.rm = TRUE)
+  n_observations = .N
 ), by = is_protected]
 
 log_message("Protection status:")
 for (i in seq_len(nrow(prot_dist))) {
-  log_message(sprintf("  Protected=%s: %s cells, mean fraction=%.3f",
+  log_message(sprintf("  Protected=%s: %s cells, %s obs",
                       prot_dist$is_protected[i],
                       format(prot_dist$n_cells[i], big.mark = ","),
-                      prot_dist$mean_protected_frac[i]))
+                      format(prot_dist$n_observations[i], big.mark = ",")))
 }
 
 # Forest cover by zone
@@ -377,7 +484,7 @@ summary_file <- file.path(final_output_path, "summary_stats.txt")
 log_message(sprintf("Writing summary: %s", summary_file))
 
 sink(summary_file)
-cat("TMF 1km Panel Dataset Summary\n")
+cat("TMF 5km Panel Dataset Summary\n")
 cat("=============================\n")
 cat(sprintf("Generated: %s\n\n", Sys.time()))
 

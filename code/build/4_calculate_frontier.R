@@ -13,43 +13,54 @@
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
+here::i_am('code/build/4_calculate_frontier.R')
+source("code/build/BUILD_workspace.R")
 
 # Record start time
 start_time <- Sys.time()
 
 # Get task ID
 task_id <- get_slurm_task_id()
-tile_id <- task_id
+current_tile_id <- task_id
 
 log_job_start("4_calculate_frontier.R", task_id)
-log_message(sprintf("Calculating frontier for tile: %d", tile_id))
+log_message(sprintf("Calculating frontier for tile: %d", current_tile_id))
 
 # Validate
-if (tile_id < 1 || tile_id > N_TMF_TILES) {
-  stop(sprintf("Invalid tile_id: %d", tile_id))
+if (current_tile_id < 1 || current_tile_id > N_TMF_TILES) {
+  stop(sprintf("Invalid tile_id: %d", current_tile_id))
 }
 
 # Check if output already exists
-output_file <- get_frontier_filename(tile_id)
-skip_if_exists(output_file, sprintf("tile %d", tile_id))
+output_file <- get_frontier_filename(current_tile_id)
+skip_if_exists(output_file, sprintf("tile %d", current_tile_id))
 
 # ==============================================================================
-# LOAD GRID CELLS FOR THIS TILE
+# LOAD GRID CELLS FOR THIS TILE (from sub-tile files)
 # ==============================================================================
 
 log_message("Loading grid cells for this tile...")
 
-grid_file <- get_grid_filename(tile_id, "parquet")
+# Get all sub-tile grid files for this TMF tile
+grid_files <- get_grid_files_for_tmf_tile(current_tile_id, "parquet")
+grid_files <- grid_files[file.exists(grid_files)]
 
-if (!file.exists(grid_file)) {
-  stop(sprintf("Grid file not found: %s. Run Stage 0 first.", grid_file))
+if (length(grid_files) == 0) {
+  stop(sprintf("No grid files found for tile %d. Run Stage 0 first.", current_tile_id))
 }
 
-grid_data <- read_parquet(grid_file)
-setDT(grid_data)
+log_message(sprintf("Found %d sub-tile grid files", length(grid_files)))
 
-log_message(sprintf("Loaded %s grid cells", format(nrow(grid_data), big.mark = ",")))
+# Load and combine all sub-tile grids
+grid_list <- lapply(grid_files, function(f) {
+  dt <- read_parquet(f)
+  setDT(dt)
+  dt
+})
+grid_data <- rbindlist(grid_list, fill = TRUE)
+
+log_message(sprintf("Loaded %s grid cells from %d sub-tiles",
+                    format(nrow(grid_data), big.mark = ","), length(grid_files)))
 
 if (nrow(grid_data) == 0) {
   log_message("Empty grid. Creating empty output.")
@@ -71,7 +82,7 @@ if (nrow(grid_data) == 0) {
 log_message("Loading interior classifications...")
 
 # Load interior data for this tile
-interior_file <- get_interior_filename(tile_id)
+interior_file <- get_interior_filename(current_tile_id)
 
 if (!file.exists(interior_file)) {
   stop(sprintf("Interior file not found: %s. Run Stage 3 first.", interior_file))
@@ -90,7 +101,7 @@ log_message(sprintf("Interior cells in this tile: %s",
 log_message("Finding neighboring tiles for 100km buffer...")
 
 # Get tile bounds
-tile_info <- TMF_TILE_INDEX[tile_id == tile_id]
+tile_info <- TMF_TILE_INDEX[tile_id == current_tile_id]
 
 # Calculate which tiles could have interior cells within 100km
 # 100km buffer in degrees (approximate: 1 degree ~ 111km at equator)
@@ -105,7 +116,7 @@ neighboring_tiles <- TMF_TILE_INDEX[
 ]$tile_id
 
 # Remove current tile
-neighboring_tiles <- setdiff(neighboring_tiles, tile_id)
+neighboring_tiles <- setdiff(neighboring_tiles, current_tile_id)
 
 log_message(sprintf("Neighboring tiles: %s", paste(neighboring_tiles, collapse = ", ")))
 
@@ -152,7 +163,7 @@ if (nrow(interior_combined) == 0) {
 
   output_data <- data.table(
     grid_id = grid_data$grid_id,
-    tile_id = tile_id,
+    tile_id = current_tile_id,
     is_frontier = FALSE,
     dist_to_interior_km = NA_real_
   )
@@ -172,12 +183,15 @@ log_message("Preparing coordinates for distance calculation...")
 grid_coords <- grid_data[, .(grid_id, centroid_lon, centroid_lat)]
 
 # Get coordinates for interior cells
-# Need to load grid parquet files to get centroid coordinates
+# Need to load grid parquet files (from sub-tiles) to get centroid coordinates
 interior_coords_list <- list()
 
 for (tid in unique(interior_combined$tile_id)) {
-  grid_file_tid <- get_grid_filename(tid, "parquet")
-  if (file.exists(grid_file_tid)) {
+  # Get all sub-tile grid files for this TMF tile
+  grid_files_tid <- get_grid_files_for_tmf_tile(tid, "parquet")
+  grid_files_tid <- grid_files_tid[file.exists(grid_files_tid)]
+
+  for (grid_file_tid in grid_files_tid) {
     grid_tid <- read_parquet(grid_file_tid)
     setDT(grid_tid)
 
@@ -185,11 +199,13 @@ for (tid in unique(interior_combined$tile_id)) {
     interior_ids <- interior_combined[tile_id == tid]$grid_id
     grid_tid <- grid_tid[grid_id %in% interior_ids]
 
-    interior_coords_list[[length(interior_coords_list) + 1]] <- grid_tid[, .(
-      grid_id,
-      centroid_lon,
-      centroid_lat
-    )]
+    if (nrow(grid_tid) > 0) {
+      interior_coords_list[[length(interior_coords_list) + 1]] <- grid_tid[, .(
+        grid_id,
+        centroid_lon,
+        centroid_lat
+      )]
+    }
   }
 }
 
@@ -219,66 +235,43 @@ grid_sf_moll <- st_transform(grid_sf, MOLLWEIDE_CRS)
 interior_sf_moll <- st_transform(interior_sf, MOLLWEIDE_CRS)
 
 # ==============================================================================
-# STRATEGY: CREATE BUFFER AROUND INTERIOR, THEN INTERSECT
+# STRATEGY: K-NN WITH RANN FOR FAST NEAREST NEIGHBOR SEARCH
+# ==============================================================================
+# Use k-d tree based nearest neighbor search (RANN package).
+# Complexity: O(n log m) instead of O(n * m) - orders of magnitude faster.
 # ==============================================================================
 
-log_message("Creating 100km buffer around interior cells...")
+log_message("Using k-NN strategy for fast distance calculation...")
 
-# Union all interior points (more efficient than buffering each)
-interior_union <- st_union(interior_sf_moll)
+# Extract projected coordinates as matrices for RANN
+grid_coords_matrix <- st_coordinates(grid_sf_moll)
+interior_coords_matrix <- st_coordinates(interior_sf_moll)
 
-# Create 100km buffer
-interior_buffer <- st_buffer(interior_union, dist = BUFFER_DISTANCE_M)
+log_message(sprintf("Building k-d tree for %s interior cells...",
+                    format(nrow(interior_coords_matrix), big.mark = ",")))
 
-log_message("Identifying cells within buffer...")
+# Find nearest interior cell for each grid cell using k-d tree
+# nn2() returns distances in the same units as input (meters for Mollweide)
+nn_result <- RANN::nn2(
+  data = interior_coords_matrix,   # Interior cells (build tree on these)
+  query = grid_coords_matrix,      # Grid cells (query these)
+  k = 1,                           # Only need nearest neighbor
+  searchtype = "priority"          # Optimized for k=1
+)
 
-# Check which grid cells intersect the buffer
-in_buffer <- st_intersects(grid_sf_moll, interior_buffer, sparse = FALSE)[, 1]
+# Extract minimum distances (in km)
+min_dists_km <- nn_result$nn.dists[, 1] / 1000
 
-n_in_buffer <- sum(in_buffer)
-log_message(sprintf("Cells in 100km buffer: %s (%.1f%%)",
-                    format(n_in_buffer, big.mark = ","),
-                    100 * n_in_buffer / nrow(grid_coords)))
+log_message(sprintf("Computed distances for %s grid cells",
+                    format(length(min_dists_km), big.mark = ",")))
 
-# ==============================================================================
-# CALCULATE EXACT DISTANCES FOR CELLS IN BUFFER
-# ==============================================================================
+# Classify as frontier (within 100km of interior)
+grid_coords[, dist_to_interior_km := min_dists_km]
+grid_coords[, is_frontier := (dist_to_interior_km <= (BUFFER_DISTANCE_M / 1000))]
 
-log_message("Calculating exact distances for cells in buffer...")
-
-# Initialize results
-grid_coords[, is_frontier := FALSE]
-grid_coords[, dist_to_interior_km := NA_real_]
-
-if (n_in_buffer > 0) {
-  # Get indices of cells in buffer
-  buffer_idx <- which(in_buffer)
-
-  # Process in chunks to manage memory
-  chunk_size <- 10000
-  n_chunks <- ceiling(length(buffer_idx) / chunk_size)
-
-  for (chunk in 1:n_chunks) {
-    chunk_start <- (chunk - 1) * chunk_size + 1
-    chunk_end <- min(chunk * chunk_size, length(buffer_idx))
-    chunk_idx <- buffer_idx[chunk_start:chunk_end]
-
-    if (chunk %% 10 == 1) {
-      log_message(sprintf("Processing chunk %d/%d...", chunk, n_chunks))
-    }
-
-    # Calculate distances from chunk cells to all interior cells
-    dist_matrix <- st_distance(grid_sf_moll[chunk_idx, ], interior_sf_moll)
-
-    # Find minimum distance for each cell
-    min_dists <- apply(dist_matrix, 1, min)
-    min_dists_km <- as.numeric(min_dists) / 1000
-
-    # Update results
-    grid_coords[chunk_idx, dist_to_interior_km := min_dists_km]
-    grid_coords[chunk_idx, is_frontier := (min_dists_km <= (BUFFER_DISTANCE_M / 1000))]
-  }
-}
+# Clean up
+rm(nn_result, grid_coords_matrix, interior_coords_matrix)
+gc()
 
 sf_use_s2(TRUE)
 
@@ -300,7 +293,7 @@ log_message("Preparing output...")
 
 output_data <- data.table(
   grid_id = grid_coords$grid_id,
-  tile_id = tile_id,
+  tile_id = current_tile_id,
   is_frontier = grid_coords$is_frontier,
   dist_to_interior_km = grid_coords$dist_to_interior_km
 )

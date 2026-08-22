@@ -1,35 +1,21 @@
 #!/bin/bash -l
-#SBATCH --time=01:00:00
-#SBATCH --job-name=TMF_INTERIOR
-#SBATCH --account=mishralab
-#SBATCH --partition=expansion
-#SBATCH --qos=normal
+#SBATCH --time=02:00:00
+#SBATCH --job-name=TMF_WDPA
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --array=1-86
+#SBATCH --array=1-87
 #SBATCH --mem=32G
 #SBATCH --output=LOGS/%x.%A_%a.out
 #SBATCH --error=LOGS/%x.%A_%a.err
 
 # ==============================================================================
-# STAGE 3: Forest Interior Classification
-# Identifies cells with >0% undisturbed forest in all years
+# STAGE 5: WDPA Protected Area Extraction
+# Uses terra::vect() to read WDPA (handles corrupt geometries internally)
+# Tasks 1-86: Extract WDPA for each tile
+# Task 87: Consolidate all tile outputs
 # ==============================================================================
 
-# sbatch runs a COPY of this script from /var/spool/slurmd/<job>/, so
-# ${BASH_SOURCE[0]} does NOT point at code/bash/ under SLURM. Resolve from
-# SLURM_SUBMIT_DIR (submit from the project root), and fall back to the script
-# location for plain `bash <script>` runs. The rerun_* helpers submit a sed'd
-# copy from $(mktemp), which is exactly why the fallback cannot be trusted here.
-if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
-  HERE="$SLURM_SUBMIT_DIR/code/bash"
-else
-  HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-fi
-[ -f "$HERE/config.sh" ] || { echo "config.sh not found at $HERE" >&2; exit 1; }
-source "$HERE/config.sh"
-frag_load_modules || exit 1
-frag_ensure_logs
+mkdir -p LOGS
 
 echo "========================================"
 echo "SLURM Job Information"
@@ -45,13 +31,13 @@ echo "========================================"
 if [[ -n "$SLURM_SUBMIT_DIR" ]]; then
     PROJECT_ROOT="$SLURM_SUBMIT_DIR"
 else
-    PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+    PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fi
 
 echo "Project root: $PROJECT_ROOT"
 cd "$PROJECT_ROOT" || exit 1
 
-R_SCRIPT="code/build/3_classify_interior.R"
+R_SCRIPT="code/build/5_extract_WDPA.R"
 
 if [[ -f "$R_SCRIPT" ]]; then
     echo "Running R script: $R_SCRIPT with task ID: $SLURM_ARRAY_TASK_ID"

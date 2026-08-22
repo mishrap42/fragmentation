@@ -9,7 +9,8 @@
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
+here::i_am('code/build/1_extract_TMF.R')
+source("code/build/BUILD_workspace.R")
 
 # Record start time
 start_time <- Sys.time()
@@ -36,19 +37,60 @@ output_file <- get_tmf_filename(tile_id, year)
 skip_if_exists(output_file, sprintf("tile %d year %d", tile_id, year))
 
 # ==============================================================================
-# LOAD GRID
+# LOAD GRID (from sub-tile files within this TMF tile)
 # ==============================================================================
 
-log_message("Loading grid cells...")
+log_message("Loading grid cells for tile...")
 
-grid_file <- get_grid_filename(tile_id, "gpkg")
+# Get all sub-tile grid files for this TMF tile
+grid_files <- get_grid_files_for_tmf_tile(tile_id, "gpkg")
+grid_files <- grid_files[file.exists(grid_files)]
 
-if (!file.exists(grid_file)) {
-  stop(sprintf("Grid file not found: %s. Run Stage 0 first.", grid_file))
+if (length(grid_files) == 0) {
+  stop(sprintf("No grid files found for TMF tile %d. Run Stage 0 first.", tile_id))
 }
 
-grid_sf <- st_read(grid_file, quiet = TRUE)
-log_message(sprintf("Loaded %d grid cells", nrow(grid_sf)))
+log_message(sprintf("Found %d sub-tile grid files", length(grid_files)))
+
+# Load and combine all sub-tile grids
+grid_list <- lapply(grid_files, function(f) {
+  st_read(f, quiet = TRUE)
+})
+grid_sf <- do.call(rbind, grid_list)
+rm(grid_list)
+
+# Check and fix geometry types
+geom_types <- as.character(unique(st_geometry_type(grid_sf)))
+geom_counts <- table(st_geometry_type(grid_sf))
+log_message(sprintf("Geometry types: %s", paste(names(geom_counts), geom_counts, sep = "=", collapse = ", ")))
+
+# Normalize if mixed types or geometry collections present
+split_grid_ids <- character(0)  # Track which grid_ids got split
+if (length(geom_types) > 1 || any(grepl("COLLECTION", geom_types))) {
+  log_message("Normalizing to MULTIPOLYGON...")
+  n_before <- nrow(grid_sf)
+  grid_sf <- st_collection_extract(grid_sf, "POLYGON")
+  grid_sf <- st_cast(grid_sf, "MULTIPOLYGON")
+  n_after <- nrow(grid_sf)
+  log_message(sprintf("After normalization: %d features (was %d)", n_after, n_before))
+
+  # Identify which grid_ids got split (have duplicates)
+  id_counts <- table(grid_sf$grid_id)
+  split_grid_ids <- names(id_counts[id_counts > 1])
+
+  if (length(split_grid_ids) > 0) {
+    log_message(sprintf("WARNING: %d grid_ids split into multiple polygons", length(split_grid_ids)))
+    log_message("Will compute area-weighted means for these cells")
+
+    # Calculate area for split polygons (needed for weighted aggregation)
+    split_idx <- grid_sf$grid_id %in% split_grid_ids
+    grid_sf$split_area <- NA_real_
+    grid_sf$split_area[split_idx] <- as.numeric(st_area(grid_sf[split_idx, ]))
+  }
+}
+
+log_message(sprintf("Loaded %d grid cells from %d sub-tiles",
+                    nrow(grid_sf), length(grid_files)))
 
 if (nrow(grid_sf) == 0) {
   log_message("Empty grid (likely ocean tile). Creating empty output.")
@@ -100,76 +142,138 @@ log_message(sprintf("Resolution: %.1f m x %.1f m",
 
 log_message("Reprojecting grid to match raster CRS...")
 
-# TMF rasters are in WGS84
 raster_crs <- terra::crs(tmf_raster, proj = TRUE)
 grid_reproj <- st_transform(grid_sf, raster_crs)
+rm(grid_sf)
 
 # ==============================================================================
-# EXTRACT TMF DATA
+# EXTRACT TMF DATA (using built-in frac function for speed)
 # ==============================================================================
 
-log_message("Extracting TMF data using exactextractr...")
+log_message(sprintf("Extracting TMF data for %d cells...", nrow(grid_reproj)))
 
-# Use exactextractr for coverage-weighted extraction
-# This handles partial cell coverage accurately
-extraction_result <- exact_extract(
+# Determine which columns to append (include split_area if present)
+append_cols <- "grid_id"
+if ("split_area" %in% names(grid_reproj)) {
+  append_cols <- c("grid_id", "split_area")
+}
+
+# Use built-in "frac" function - much faster than custom R function
+# Returns wide format: grid_id, frac_0, frac_1, frac_2, ...
+extraction_wide <- exact_extract(
   tmf_raster,
   grid_reproj,
-  fun = function(df) {
-    # df has columns: value, coverage_fraction
-    setDT(df)
-
-    # Filter out NA values
-    df <- df[!is.na(value)]
-
-    if (nrow(df) == 0) {
-      return(data.table(value = integer(0), fraction = numeric(0)))
-    }
-
-    # Calculate total coverage fraction per value
-    # Normalize by total coverage to get proportions within the cell
-    total_coverage <- sum(df$coverage_fraction, na.rm = TRUE)
-
-    if (total_coverage == 0) {
-      return(data.table(value = integer(0), fraction = numeric(0)))
-    }
-
-    result <- df[, .(
-      fraction = sum(coverage_fraction, na.rm = TRUE) / total_coverage
-    ), by = value]
-
-    return(result)
-  },
-  summarize_df = TRUE,
-  include_cols = "grid_id",
+  fun = "frac",
+  append_cols = append_cols,
   progress = TRUE
 )
 
-log_message(sprintf("Extraction complete: %d rows", nrow(extraction_result)))
+rm(grid_reproj)
+log_message(sprintf("Extraction complete: %d rows, %d columns",
+                    nrow(extraction_wide), ncol(extraction_wide)))
 
 # ==============================================================================
-# PROCESS RESULTS
+# PROCESS RESULTS (reshape wide to long)
 # ==============================================================================
 
 log_message("Processing results...")
 
-setDT(extraction_result)
+setDT(extraction_wide)
 
-# Filter out empty results
-extraction_result <- extraction_result[!is.na(value) & fraction > 0]
+# Get the frac columns (frac_0, frac_1, etc.)
+frac_cols <- grep("^frac_", names(extraction_wide), value = TRUE)
+log_message(sprintf("Found %d TMF classes in data", length(frac_cols)))
+
+# Determine id.vars for melt (include split_area if present)
+has_split_area <- "split_area" %in% names(extraction_wide)
+id_vars <- if (has_split_area) c("grid_id", "split_area") else "grid_id"
+
+# Reshape from wide to long
+extraction_long <- melt(
+  extraction_wide,
+  id.vars = id_vars,
+  measure.vars = frac_cols,
+  variable.name = "frac_col",
+  value.name = "fraction"
+)
+
+rm(extraction_wide)
+
+# Extract the TMF value from column name (frac_1 -> 1)
+extraction_long[, value := as.integer(sub("frac_", "", frac_col))]
+extraction_long[, frac_col := NULL]
+
+# Filter out zero/NA fractions
+extraction_long <- extraction_long[!is.na(fraction) & fraction > 0]
+
+log_message(sprintf("After filtering: %d non-zero cell-class combinations",
+                    nrow(extraction_long)))
 
 # Add year column
-extraction_result[, year := year]
+extraction_long[, year := year]
 
 # Map TMF values to class names
-extraction_result <- merge(extraction_result, TMF_LEGEND,
-                           by = "value", all.x = TRUE)
+extraction_long <- merge(extraction_long, TMF_LEGEND,
+                         by = "value", all.x = TRUE)
 
 # Handle any unmapped values
-extraction_result[is.na(tmf_class), tmf_class := paste0("Unknown_", value)]
+extraction_long[is.na(tmf_class), tmf_class := paste0("Unknown_", value)]
 
-# Select and order columns
-output_data <- extraction_result[, .(grid_id, year, tmf_class, fraction)]
+# ==============================================================================
+# AGGREGATE SPLIT POLYGONS (area-weighted means)
+# ==============================================================================
+
+# For grid_ids that were split by st_collection_extract, we need to compute
+# area-weighted means. Non-split grid_ids pass through unchanged.
+
+n_before_agg <- nrow(extraction_long)
+
+if (has_split_area && length(split_grid_ids) > 0) {
+  log_message(sprintf("Computing area-weighted means for %d split grid_ids...",
+                      length(split_grid_ids)))
+
+  # Separate split and non-split rows
+  split_rows <- extraction_long[grid_id %in% split_grid_ids]
+  nonsplit_rows <- extraction_long[!(grid_id %in% split_grid_ids)]
+
+  # For split rows: compute area-weighted mean
+  if (nrow(split_rows) > 0) {
+    split_agg <- split_rows[, .(
+      fraction = weighted.mean(fraction, split_area, na.rm = TRUE)
+    ), by = .(grid_id, year, tmf_class)]
+
+    log_message(sprintf("  Split rows: %d -> %d after aggregation",
+                        nrow(split_rows), nrow(split_agg)))
+  } else {
+    split_agg <- data.table(grid_id = character(0), year = integer(0),
+                            tmf_class = character(0), fraction = numeric(0))
+  }
+
+  # For non-split rows: just select columns (no aggregation needed)
+  nonsplit_out <- nonsplit_rows[, .(grid_id, year, tmf_class, fraction)]
+
+  # Combine
+  output_data <- rbind(nonsplit_out, split_agg)
+
+} else {
+  # No split polygons - just select columns
+  output_data <- extraction_long[, .(grid_id, year, tmf_class, fraction)]
+
+  # Still check for any unexpected duplicates and aggregate with simple mean
+  dup_check <- output_data[, .N, by = .(grid_id, year, tmf_class)][N > 1]
+  if (nrow(dup_check) > 0) {
+    log_message(sprintf("WARNING: Found %d unexpected duplicates, using simple mean",
+                        nrow(dup_check)))
+    output_data <- output_data[, .(fraction = mean(fraction)), by = .(grid_id, year, tmf_class)]
+  }
+}
+
+n_after_agg <- nrow(output_data)
+
+if (n_before_agg != n_after_agg) {
+  log_message(sprintf("Aggregated %d duplicate (grid_id, tmf_class) combinations",
+                      n_before_agg - n_after_agg))
+}
 
 # Sort for consistent output
 setorder(output_data, grid_id, tmf_class)

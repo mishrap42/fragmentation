@@ -1,32 +1,30 @@
 #!/bin/bash -l
-#SBATCH --time=08:00:00
-#SBATCH --job-name=TMF_EXTRACT
+#SBATCH --time=03:00:00
+#SBATCH --job-name=TMF_YIELDS
 #SBATCH --account=mishralab
 #SBATCH --partition=expansion
 #SBATCH --qos=normal
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --array=1-1000
-#SBATCH --mem=32G
+#SBATCH --array=1-344
+#SBATCH --mem=8G
 #SBATCH --output=LOGS/%x.%A_%a.out
 #SBATCH --error=LOGS/%x.%A_%a.err
 
 # ==============================================================================
-# STAGE 1: TMF Data Extraction
-# Extracts TMF land cover fractions for each tile-year combination
-# Total jobs: 86 tiles x 34 years (1990-2023) = 2,924 jobs
+# STAGE 0c: EarthStat Crop Raster Extraction
+# Per sub-tile, extracts 346 rasters onto the grid:
+#   172 x <crop>_YieldPerHectare       -> yield_<crop>
+#   172 x <crop>_HarvestedAreaFraction -> cropshare_<crop>
+#     2 x Cropland2000_5m / Pasture2000_5m -> cropland_frac / pasture_frac
 #
-# MaxArraySize on this cluster is 1001, so 2,924 tasks CANNOT be submitted as
-# one array - indices above 1000 are rejected outright. Submit in three chunks,
-# passing TASK_ID_OFFSET so each array numbers itself 1-1000 while the R script
-# recovers the true task id (see get_slurm_task_id in BUILD_workspace.R):
+# Walltime raised 01:00 -> 03:00 on 2026-08-21: the 01:00 budget was set when
+# this stage pointed at GAEZ (~138 rasters). EarthStat is 2.5x that count and
+# each raster is a separate open + exact_extract pass.
 #
-#   sbatch --mem=8G --export=ALL,TASK_ID_OFFSET=0    --array=1-1000%200 <this>   # tasks    1-1000, tiles  1-30
-#   sbatch --mem=8G --export=ALL,TASK_ID_OFFSET=1000 --array=1-1000%200 <this>   # tasks 1001-2000, tiles 30-59
-#   sbatch --mem=8G --export=ALL,TASK_ID_OFFSET=2000 --array=1-890%200  <this>   # tasks 2001-2890, tiles 59-85
+# Array size: 344 sub-tiles (same as Stage 0)
 #
-# Tile 86 (tasks 2891-2924) is held back until sub-tile 337's grid exists.
-# --mem=8G: the pilot used 197 MB against the old 32G request.
+# PREREQUISITE: Run Stage 0 first to create grid files
 # ==============================================================================
 
 # sbatch runs a COPY of this script from /var/spool/slurmd/<job>/, so
@@ -44,7 +42,6 @@ source "$HERE/config.sh"
 frag_load_modules || exit 1
 frag_ensure_logs
 
-# Print job information
 echo "========================================"
 echo "SLURM Job Information"
 echo "========================================"
@@ -56,7 +53,6 @@ echo "Node: $SLURMD_NODENAME"
 echo "Start Time: $(date)"
 echo "========================================"
 
-# Determine project root
 if [[ -n "$SLURM_SUBMIT_DIR" ]]; then
     PROJECT_ROOT="$SLURM_SUBMIT_DIR"
 else
@@ -64,12 +60,9 @@ else
 fi
 
 echo "Project root: $PROJECT_ROOT"
-
-# Change to project directory
 cd "$PROJECT_ROOT" || exit 1
 
-# Set R script path
-R_SCRIPT="code/build/1_extract_TMF.R"
+R_SCRIPT="code/build/0c_extract_yields.R"
 
 if [[ -f "$R_SCRIPT" ]]; then
     echo "Running R script: $R_SCRIPT with task ID: $SLURM_ARRAY_TASK_ID"
@@ -78,8 +71,6 @@ if [[ -f "$R_SCRIPT" ]]; then
     echo "R script exited with code: $EXIT_CODE"
 else
     echo "Error: R script not found at $R_SCRIPT"
-    echo "Current working directory: $(pwd)"
-    ls -la code/build/
     exit 1
 fi
 

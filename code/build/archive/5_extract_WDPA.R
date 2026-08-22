@@ -10,7 +10,8 @@
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
+here::i_am('code/build/5_extract_WDPA.R')
+source("code/build/BUILD_workspace.R")
 
 # Record start time
 start_time <- Sys.time()
@@ -79,19 +80,29 @@ output_file <- get_wdpa_filename(tile_id)
 skip_if_exists(output_file, sprintf("tile %d", tile_id))
 
 # ==============================================================================
-# LOAD GRID CELLS FOR THIS TILE
+# LOAD GRID CELLS FOR THIS TILE (from sub-tile files)
 # ==============================================================================
 
 log_message("Loading grid cells...")
 
-grid_file <- get_grid_filename(tile_id, "gpkg")
+# Get all sub-tile grid files for this TMF tile
+grid_files <- get_grid_files_for_tmf_tile(tile_id, "gpkg")
+grid_files <- grid_files[file.exists(grid_files)]
 
-if (!file.exists(grid_file)) {
-  stop(sprintf("Grid file not found: %s", grid_file))
+if (length(grid_files) == 0) {
+  stop(sprintf("No grid files found for tile %d. Run Stage 0 first.", tile_id))
 }
 
-grid_sf <- st_read(grid_file, quiet = TRUE)
-log_message(sprintf("Loaded %d grid cells", nrow(grid_sf)))
+log_message(sprintf("Found %d sub-tile grid files", length(grid_files)))
+
+# Load and combine all sub-tile grids
+grid_list <- lapply(grid_files, function(f) {
+  st_read(f, quiet = TRUE)
+})
+grid_sf <- do.call(rbind, grid_list)
+
+log_message(sprintf("Loaded %d grid cells from %d sub-tiles",
+                    nrow(grid_sf), length(grid_files)))
 
 if (nrow(grid_sf) == 0) {
   log_message("Empty grid. Creating empty output.")
@@ -179,22 +190,16 @@ tile_bbox_buffered <- c(
   ymax = tile_bbox["ymax"] + buffer_deg
 )
 
-# Read WDPA with bounding box filter
+# Read WDPA with spatial filter for this tile
+# Uses terra::vect() internally which handles corrupt geometries better than sf
 log_message(sprintf("Reading WDPA for bbox: [%.2f, %.2f] to [%.2f, %.2f]",
                     tile_bbox_buffered[1], tile_bbox_buffered[2],
                     tile_bbox_buffered[3], tile_bbox_buffered[4]))
 
-# Note: This assumes WDPA file supports spatial filtering
-# If not, we read all and filter
-wdpa <- tryCatch({
-  st_read(wdpa_path, quiet = TRUE,
-          wkt_filter = st_as_text(st_as_sfc(st_bbox(tile_bbox_buffered))))
-}, error = function(e) {
-  log_message("Spatial filter failed, reading full WDPA and filtering...")
-  wdpa_full <- st_read(wdpa_path, quiet = TRUE)
-  bbox_poly <- st_as_sfc(st_bbox(tile_bbox_buffered), crs = st_crs(wdpa_full))
-  wdpa_full[st_intersects(wdpa_full, bbox_poly, sparse = FALSE)[, 1], ]
-})
+wdpa <- read_wdpa(bbox = c(
+  tile_bbox_buffered[1], tile_bbox_buffered[2],
+  tile_bbox_buffered[3], tile_bbox_buffered[4]
+))
 
 log_message(sprintf("Loaded %d protected areas", nrow(wdpa)))
 
@@ -217,19 +222,9 @@ if (nrow(wdpa) == 0) {
   quit(save = "no", status = 0)
 }
 
-# ==============================================================================
-# CLEAN WDPA GEOMETRIES
-# ==============================================================================
-
-log_message("Cleaning WDPA geometries...")
-
-# Make valid
-wdpa <- make_valid_safe(wdpa)
-
-# Remove empty geometries
-wdpa <- wdpa[!st_is_empty(wdpa), ]
-
-log_message(sprintf("After cleaning: %d protected areas", nrow(wdpa)))
+# WDPA is pre-cleaned by create_clean_wdpa() on first call
+# Corrupt geometries were dropped, statistics logged
+log_message(sprintf("Using %d protected areas", nrow(wdpa)))
 
 # ==============================================================================
 # EXTRACT WDPA METADATA FOR EACH CELL
@@ -241,9 +236,28 @@ sf_use_s2(FALSE)
 
 # Calculate intersection between grid cells and protected areas
 # This gives us the area of each PA in each cell
-intersections <- st_intersection(grid_sf, wdpa)
+# Wrap in tryCatch to handle any remaining geometry issues
+intersections <- tryCatch({
+  st_intersection(grid_sf, wdpa)
+}, error = function(e) {
+  log_message(sprintf("st_intersection failed: %s", e$message))
+  log_message("Trying with additional geometry repair...")
 
-sf_use_s2(TRUE)
+  # Try more aggressive geometry repair
+  wdpa_fixed <- st_buffer(wdpa, 0)  # Zero-buffer often fixes topology issues
+  wdpa_fixed <- wdpa_fixed[!st_is_empty(wdpa_fixed), ]
+
+  tryCatch({
+    st_intersection(grid_sf, wdpa_fixed)
+  }, error = function(e2) {
+    log_message(sprintf("Still failing after repair: %s", e2$message))
+    log_message("Returning empty intersections")
+    # Return empty sf with correct structure
+    grid_sf[0, ]
+  })
+})
+
+# Keep S2 off until after all st_area() calls to avoid degenerate geometry errors
 
 log_message(sprintf("Found %d cell-PA intersections", nrow(intersections)))
 
@@ -283,6 +297,9 @@ grid_areas <- data.table(
   grid_id = grid_sf$grid_id,
   cell_area = as.numeric(st_area(grid_sf))
 )
+
+# Re-enable S2 now that geometry operations are done
+sf_use_s2(TRUE)
 
 # Sum intersection areas per cell
 cell_protection <- int_dt[, .(

@@ -1,0 +1,4 @@
+# Keep LOGS/ in the repo. SLURM opens the --output file BEFORE the job script
+# runs, so a job submitted into a fresh checkout with no LOGS/ directory dies
+# with no output and no clear cause. frag_ensure_logs covers the submitter
+# path; this covers a direct `sbatch code/bash/<stage>.sh`.

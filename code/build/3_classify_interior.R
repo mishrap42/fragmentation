@@ -2,15 +2,15 @@
 # STAGE 3: CLASSIFY FOREST INTERIOR
 # ==============================================================================
 # This script identifies grid cells that are "forest interior" - cells that
-# had >0% undisturbed forest in EVERY year of the TMF data (1990-2024).
+# had >0% undisturbed forest in EVERY year of the TMF data (1990-2023).
 #
 # Input: SLURM_ARRAY_TASK_ID (1 to N_TMF_TILES)
 # Output: Data/build/classifications/interior_tile_{tile_id}.parquet
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
-
+here::i_am('code/build/3_classify_interior.R')
+source("code/build/BUILD_workspace.R")
 # Record start time
 start_time <- Sys.time()
 
@@ -118,12 +118,15 @@ log_message(sprintf("Calculated stats for %s cells",
 
 log_message("Classifying interior cells...")
 
-# Interior definition: >0% undisturbed in ALL years
-# Note: We check for presence in all TMF years
-expected_years <- N_TMF_YEARS
+# Interior definition: >=90% undisturbed in at least 30 years
+# Using 30 years threshold since recent data (last ~2 years) may be unreliable
+MIN_YEARS_INTERIOR <- 30
+MIN_UNDISTURBED_FRAC <- 0.90
+log_message(sprintf("Interior threshold: >= %.0f%% undisturbed in >= %d years",
+                    MIN_UNDISTURBED_FRAC * 100, MIN_YEARS_INTERIOR))
 
-cell_stats[, is_interior := (min_undisturbed_frac > 0) &
-             (n_years_observed >= expected_years)]
+cell_stats[, is_interior := (min_undisturbed_frac >= MIN_UNDISTURBED_FRAC) &
+             (n_years_observed >= MIN_YEARS_INTERIOR)]
 
 # Count
 n_interior <- sum(cell_stats$is_interior)

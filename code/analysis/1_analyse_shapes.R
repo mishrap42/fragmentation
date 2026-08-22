@@ -1,46 +1,70 @@
-library(here)        # Manage file paths relative to project root
-here::i_am("code/analysis/1_analyse_shapes.R")
-library(sf)          # Spatial data handling (reading shapefiles, geometric operations)
-library(ggplot2)     # Data visualization and plotting
-library(dplyr)       # Data manipulation (filtering, grouping, summarizing)
-library(gridExtra)   # Arrange multiple plots side-by-side
-library(readxl)      # Read Excel files
-library(binsreg)     # Binned regression plots
-library(lubridate)   # Date/time manipulation
-library(Hmisc)       # Miscellaneous data analysis functions
-library(fixest)      # Fast fixed-effects regressions
-library(countrycode) # Convert country codes/names
-library(data.table)
-library(janitor)      # Data cleaning functions
-library(quantreg)      # Quantile regression
+# library(here)        # Manage file paths relative to project root
+# here::i_am("code/analysis/1_analyse_shapes.R")
+# library(sf)          # Spatial data handling (reading shapefiles, geometric operations)
+# library(ggplot2)     # Data visualization and plotting
+# library(dplyr)       # Data manipulation (filtering, grouping, summarizing)
+# library(gridExtra)   # Arrange multiple plots side-by-side
+# library(readxl)      # Read Excel files
+# library(binsreg)     # Binned regression plots
+# library(lubridate)   # Date/time manipulation
+# library(Hmisc)       # Miscellaneous data analysis functions
+# library(fixest)      # Fast fixed-effects regressions
+# library(countrycode) # Convert country codes/names
+# library(data.table)
+# library(janitor)      # Data cleaning functions
+# library(quantreg)      # Quantile regression
 
-set.seed(42)
+# set.seed(42)
 
-# This stores your repository path as a function "here()"
-if (grepl("ahaanj", here())) {
-  dropbox_dir <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/"
-  i = 1
-} else if (grepl("mishrap", here())) {
-  dropbox_dir <- "/Users/mishrap/Dropbox (Personal)/Protected Area Fragmentation/"
-  i = 1
-} 
+# # This stores your repository path as a function "here()"
+# if (grepl("ahaanj", here())) {
+#   dropbox_dir <- "/Users/ahaanj/Dartmouth College Dropbox/Ahaan Jindal/Protected Area Fragmentation/"
+#   i = 1
+# } else if (grepl("mishrap", here())) {
+#   dropbox_dir <- "/Users/mishrap/Dropbox (Personal)/Protected Area Fragmentation/"
+#   i = 1
+# } 
 
-intermediate_data_dir = file.path(dropbox_dir, 'Data/build')
-figure_dir = file.path(dropbox_dir, 'Figures', '1_analyse_shapes')
-if (!dir.exists(figure_dir)) dir.create(figure_dir, recursive = TRUE)
+# intermediate_data_dir = file.path(dropbox_dir, 'Data/build')
+# figure_dir = file.path(dropbox_dir, 'Figures', '1_analyse_shapes')
+# if (!dir.exists(figure_dir)) dir.create(figure_dir, recursive = TRUE)
 
-# ========== LOAD CONSOLIDATED SHAPE METRICS DATASET ==========
-pa_shapes_complete <- fread(file.path(intermediate_data_dir, 'pa_shapes_complete.gz'))
-pa_shapes_complete <- pa_shapes_complete %>%
-  clean_names()
-pa_shapefile = st_read(file.path(dropbox_dir, 'Data/raw/protected sites/protectedsites.shp'))
-pa_shapefile$area = units::drop_units(units::set_units(st_area(pa_shapefile), 'km^2'))
-pa_shapes_complete = merge(pa_shapes_complete, pa_shapefile %>% st_drop_geometry() %>% select(cddaId, area), by.x = 'cdda_id', by.y = c('cddaId'))
+# # ========== LOAD CONSOLIDATED SHAPE METRICS DATASET ==========
+# pa_shapes_complete <- fread(file.path(intermediate_data_dir, 'pa_shapes_complete.gz'))
+# pa_shapes_complete <- pa_shapes_complete %>%
+#   clean_names()
+# pa_shapefile = st_read(file.path(dropbox_dir, 'Data/raw/protected sites/protectedsites.shp'))
+# pa_shapefile$area = units::drop_units(units::set_units(st_area(pa_shapefile), 'km^2'))
+# pa_shapes_complete = merge(pa_shapes_complete, pa_shapefile %>% st_drop_geometry() %>% select(cddaId, area), by.x = 'cdda_id', by.y = c('cddaId'))
 
-pa_shapes_complete = pa_shapes_complete[legl_fnd < 2025 & legl_fnd > 1950]
+pa_shapes_complete = pa_shapes_complete[legl_fnd < 2025 & legl_fnd >= 1980]
 
 max_year_prior_to_natura = pa_shapes_complete[legl_fnd < 1992,.(max(legl_fnd, na.rm = TRUE))]
-m.resid = feols(dscnnc ~ i(legl_fnd, ref = .[max_year_prior_to_natura]) + splines::bs(area, 5) | cdd_cntr^iucn_ctg, data = pa_shapes_complete)
+pa_shapes_complete[,POST := legl_fnd >= 1992]
+pa_shapes_complete[,.(area = median(area, na.rm = TRUE)), by = .( iucn_ctg)] %>%
+ggplot() + 
+geom_col(aes( x = iucn_ctg, y = area, fill = iucn_ctg), position = position_dodge())
+
+pa_shapes_complete[,.(dscnnc = mean(dscnnc, na.rm = TRUE)), by = .(iucn_ctg)] %>%
+ggplot() + 
+geom_col(aes( x = iucn_ctg, y = dscnnc, fill = iucn_ctg), position = position_dodge())
+
+pa_shapes_complete[,.(dscnnc = median(dscnnc, na.rm = TRUE)), by = .(iucn_ctg)] %>%
+ggplot() + 
+geom_col(aes( x = iucn_ctg, y = dscnnc, fill = iucn_ctg), position = position_dodge())
+
+
+m.resid = feols(dscnnc ~ i(legl_fnd, ref = .[max_year_prior_to_natura]) + poly(area, 5), data = pa_shapes_complete[area > 30,]) # pa_shapes_complete[!(cdda_id %in% c('555514087', '555514089', '555545790')),]) # cdd_cntr^iucn_ctg + cdd_cntr^legl_fnd + iucn_ctg^leg_fnd
+
+bplt = binsreg(
+  y = pa_shapes_complete$dscnnc,
+  x = pa_shapes_complete$legl_fnd,
+  w = pa_shapes_complete$area,
+  randcut = 1,
+  nbins = 10
+)
+
+bplt$bins_plot + geom_vline(xintercept = 1992)
 
 # Extract year coefficients (excluding area)
 coef_names <- names(coef(m.resid))
@@ -95,6 +119,7 @@ ggsave(file.path(figure_dir, "disconnection_by_year_aer.png"),
 
 print(p_aer)
 
+stopifnot(0)
 m.iucn = feols(dscnnc ~ i(legl_fnd, ref = .[max_year_prior_to_natura]) + splines::bs(area, 5) | cdd_cntr, data = pa_shapes_complete, split = ~ iucn_ctg)
 
 # Extract split-specific coefficients
@@ -163,7 +188,7 @@ ggsave(file.path(figure_dir, "disconnection_by_year_iucn.png"),
 
 print(p_iucn)
 
-
+stopifnot(0)
 
 m.country = feols(dscnnc ~ i(legl_fnd, ref = .[max_year_prior_to_natura]) + splines::bs(area, 5) | iucn_ctg, data = pa_shapes_complete, split = ~ cdd_cntr)
 
@@ -287,7 +312,7 @@ ggsave(file.path(figure_dir, "disconnection_country_unclear.png"),
 
 print(p_country_positive)
 print(p_country_unclear)
-
+stopifnot(0)
 
 # Quantile regression analysis
 pa_shapes_complete[,post_natura := fifelse(legl_fnd >= 1992, 1, 0)]

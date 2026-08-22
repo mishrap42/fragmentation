@@ -1,22 +1,41 @@
 #!/bin/bash -l
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --job-name=TMF_GRID
+#SBATCH --account=mishralab
+#SBATCH --partition=expansion
+#SBATCH --qos=normal
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --array=1-86
-#SBATCH --mem=32G
+#SBATCH --array=1-344
+#SBATCH --mem=16G
 #SBATCH --output=LOGS/%x.%A_%a.out
 #SBATCH --error=LOGS/%x.%A_%a.err
 
 # ==============================================================================
-# STAGE 0: Grid Generation
-# Creates 1km x 1km equal-area grid cells for each TMF tile
+# STAGE 0: Grid Generation (5x5 degree sub-tiles)
+# Creates 5km x 5km equal-area grid cells for each 5x5 degree sub-tile
+# Grid cells are cut on country + WDPA boundaries
+#
+# Array size: 86 TMF tiles × 4 sub-tiles (5° in 10°) = 344
+#
+# PREREQUISITE: Run 0a_wdpa.sh first to create wdpa_cleaned.gpkg
 # ==============================================================================
 
-# Create LOGS directory if it doesn't exist
-mkdir -p LOGS
+# sbatch runs a COPY of this script from /var/spool/slurmd/<job>/, so
+# ${BASH_SOURCE[0]} does NOT point at code/bash/ under SLURM. Resolve from
+# SLURM_SUBMIT_DIR (submit from the project root), and fall back to the script
+# location for plain `bash <script>` runs. The rerun_* helpers submit a sed'd
+# copy from $(mktemp), which is exactly why the fallback cannot be trusted here.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  HERE="$SLURM_SUBMIT_DIR/code/bash"
+else
+  HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fi
+[ -f "$HERE/config.sh" ] || { echo "config.sh not found at $HERE" >&2; exit 1; }
+source "$HERE/config.sh"
+frag_load_modules || exit 1
+frag_ensure_logs
 
-# Print job information
 echo "========================================"
 echo "SLURM Job Information"
 echo "========================================"
@@ -28,21 +47,16 @@ echo "Node: $SLURMD_NODENAME"
 echo "Start Time: $(date)"
 echo "========================================"
 
-# Determine project root
 if [[ -n "$SLURM_SUBMIT_DIR" ]]; then
     PROJECT_ROOT="$SLURM_SUBMIT_DIR"
 else
-    # Fallback for local testing
-    PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 fi
 
 echo "Project root: $PROJECT_ROOT"
-
-# Change to project directory
 cd "$PROJECT_ROOT" || exit 1
 
-# Set R script path
-R_SCRIPT="Code/0_create_grid.R"
+R_SCRIPT="code/build/0_create_grid.R"
 
 if [[ -f "$R_SCRIPT" ]]; then
     echo "Running R script: $R_SCRIPT with task ID: $SLURM_ARRAY_TASK_ID"
@@ -51,8 +65,6 @@ if [[ -f "$R_SCRIPT" ]]; then
     echo "R script exited with code: $EXIT_CODE"
 else
     echo "Error: R script not found at $R_SCRIPT"
-    echo "Current working directory: $(pwd)"
-    ls -la Code/
     exit 1
 fi
 

@@ -47,3 +47,22 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# SLURM job logs (keep the directory, drop its contents)
+LOGS/*.out
+LOGS/*.err
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Data: built artefacts and raw inputs live on the cluster, not in git.
+# data/build/final/TMF_5km_panel.parquet alone is ~3 GB.
+data/build/
+data/raw/
+data/temp/
+data/intermediate/
+Data/
+# Keep the directory skeleton and small code-adjacent lookups
+!data/**/.gitkeep
+!data/lookup/

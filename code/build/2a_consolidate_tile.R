@@ -9,7 +9,8 @@
 # ==============================================================================
 
 # Load configuration
-source("Code/BUILD_workspace.R")
+here::i_am('code/build/2a_consolidate_tile.R')
+source("code/build/BUILD_workspace.R")
 
 # Record start time
 start_time <- Sys.time()
@@ -130,6 +131,18 @@ combined_data <- combined_data[!is.na(grid_id) & !is.na(year) & !is.na(tmf_class
 
 # Remove zero or negative fractions
 combined_data <- combined_data[fraction > 0]
+
+# Deduplicate by aggregating any duplicate (grid_id, year, tmf_class) combinations
+# Stage 1 now handles area-weighted aggregation, so duplicates should be rare
+# This is a safety net using simple mean as fallback
+n_before_dedup <- nrow(combined_data)
+combined_data <- combined_data[, .(fraction = mean(fraction)), by = .(grid_id, year, tmf_class)]
+n_after_dedup <- nrow(combined_data)
+
+if (n_before_dedup != n_after_dedup) {
+  log_message(sprintf("WARNING: Found %d unexpected duplicates (should be handled in Stage 1)",
+                      n_before_dedup - n_after_dedup))
+}
 
 # Sort for consistent output
 setorder(combined_data, grid_id, year, tmf_class)

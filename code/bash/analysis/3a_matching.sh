@@ -1,20 +1,38 @@
 #!/bin/bash -l
 #SBATCH --time=04:00:00
-#SBATCH --job-name=TMF_WDPA
+#SBATCH --job-name=MATCH_COUNTRY
+#SBATCH --account=mishralab
+#SBATCH --partition=expansion
+#SBATCH --qos=normal
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --array=1-87
-#SBATCH --mem=64G
+#SBATCH --array=1-128
+#SBATCH --mem=32G
 #SBATCH --output=LOGS/%x.%A_%a.out
 #SBATCH --error=LOGS/%x.%A_%a.err
 
 # ==============================================================================
-# STAGE 5: WDPA Protected Area Extraction
-# Tasks 1-86: Extract WDPA for each tile
-# Task 87: Consolidate all tile outputs
+# 3a_matching.sh - Per-Country Matching + Event Study
+# Each array task: matches treated/control cells, runs TWFE, generates figure
+#
+# Array size: 128 (overestimate; R script handles out-of-range gracefully)
+# Memory: 16G per task (panel loading for matched cells)
 # ==============================================================================
 
-mkdir -p LOGS
+# sbatch runs a COPY of this script from /var/spool/slurmd/<job>/, so
+# ${BASH_SOURCE[0]} does NOT point at code/bash/ under SLURM. Resolve from
+# SLURM_SUBMIT_DIR (submit from the project root), and fall back to the script
+# location for plain `bash <script>` runs. The rerun_* helpers submit a sed'd
+# copy from $(mktemp), which is exactly why the fallback cannot be trusted here.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  HERE="$SLURM_SUBMIT_DIR/code/bash"
+else
+  HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fi
+[ -f "$HERE/config.sh" ] || { echo "config.sh not found at $HERE" >&2; exit 1; }
+source "$HERE/config.sh"
+frag_load_modules || exit 1
+frag_ensure_logs
 
 echo "========================================"
 echo "SLURM Job Information"
@@ -30,13 +48,13 @@ echo "========================================"
 if [[ -n "$SLURM_SUBMIT_DIR" ]]; then
     PROJECT_ROOT="$SLURM_SUBMIT_DIR"
 else
-    PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    PROJECT_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 fi
 
 echo "Project root: $PROJECT_ROOT"
 cd "$PROJECT_ROOT" || exit 1
 
-R_SCRIPT="Code/5_extract_WDPA.R"
+R_SCRIPT="code/analysis/3a_matching.R"
 
 if [[ -f "$R_SCRIPT" ]]; then
     echo "Running R script: $R_SCRIPT with task ID: $SLURM_ARRAY_TASK_ID"

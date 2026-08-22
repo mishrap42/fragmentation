@@ -152,7 +152,48 @@ add_check("yields", "columns", "value columns present",
 add_check("yields", "rows", "non-empty",
           nrow(yields) > 0, sprintf("%s rows", format(nrow(yields), big.mark = ",")))
 
-yields_geo <- merge(yields, grid_coords, by = "grid_id", all.x = TRUE)
+# ------------------------------------------------------------------------------
+# WHICH COLUMNS GET PLOTTED
+# ------------------------------------------------------------------------------
+# Numeric checks run on ALL columns. Plots do not. At 25 columns (the 14-crop
+# partial extraction this script was written against) plotting everything cost
+# 50 PNGs; at the full 172-crop extraction it is ~690, which overruns the 3h
+# wall and buries the informative figures among 600 near-empty ones.
+#
+# So: the land-use/summary layers always, plus the top N crops by mean cell
+# share and their matching yield layers. What is dropped is logged rather than
+# silently truncated - a validator that quietly narrows its own coverage is the
+# failure mode this whole script exists to catch.
+
+PLOT_TOP_N_CROPS <- 12
+
+always_plot <- intersect(c("cropland_frac", "pasture_frac", "cropshare_total"),
+                         yield_cols)
+
+if (length(s_cols) > 0) {
+  crop_rank  <- sort(sapply(s_cols, function(c) mean(yields[[c]], na.rm = TRUE)),
+                     decreasing = TRUE)
+  top_crops  <- sub("^cropshare_", "", head(names(crop_rank), PLOT_TOP_N_CROPS))
+} else {
+  top_crops <- character(0)
+}
+
+plot_cols <- intersect(unique(c(always_plot,
+                                paste0("cropshare_", top_crops),
+                                paste0("yield_", top_crops))),
+                       yield_cols)
+
+log_message(sprintf("Plotting %d of %d columns (top %d crops by mean share + %d land-use layers)",
+                    length(plot_cols), length(yield_cols),
+                    length(top_crops), length(always_plot)))
+log_message(sprintf("  plotted: %s", paste(plot_cols, collapse = ", ")))
+log_message(sprintf("  NOT plotted (checked numerically only): %d columns",
+                    length(setdiff(yield_cols, plot_cols))))
+
+# Only the plotted columns are joined to coordinates. Merging the full 345-column
+# table would duplicate ~5.5 GB for the sake of a dozen scatterplots.
+yields_geo <- merge(yields[, c("grid_id", plot_cols), with = FALSE],
+                    grid_coords, by = "grid_id", all.x = TRUE)
 
 summary_rows <- list()
 for (col in yield_cols) {
@@ -176,13 +217,18 @@ for (col in yield_cols) {
                 min(vv) >= -1e-9 && max(vv) <= 1 + 1e-9,
                 sprintf("range [%.4f, %.4f]", min(vv), max(vv)))
     }
-    # EarthStat YieldPerHectare is tons/ha. Single digits for most crops;
-    # sugarcane is the legitimate outlier (~60-80). >200 means a unit error.
+    # EarthStat YieldPerHectare is tons/ha. Single digits for most grains, but
+    # the 172-crop set includes fresh-weight sugar and fodder crops (sugarcane,
+    # beetfor, cabbagefor, alfalfa, grass) that legitimately reach the low
+    # hundreds. The failure this catches is a UNIT error - a kg/ha layer read as
+    # t/ha is off by 1000x - so the ceiling only has to sit above real fresh
+    # weights and far below 1000x. 200 was calibrated against the 14-crop
+    # partial extraction and would now FAIL on correct fodder data.
     if (startsWith(col, "yield_")) {
       add_check("yields", col, "non-negative", min(vv) >= -1e-9,
                 sprintf("min = %.4f", min(vv)))
-      add_check("yields", col, "plausible magnitude (max < 200 t/ha)",
-                max(vv) < 200, sprintf("max = %.2f", max(vv)))
+      add_check("yields", col, "plausible magnitude (max < 500 t/ha)",
+                max(vv) < 500, sprintf("max = %.2f", max(vv)))
     }
   }
 
@@ -198,12 +244,91 @@ for (col in yield_cols) {
                       if (n_valid) median(vv) else NA_real_,
                       if (n_valid) max(vv) else NA_real_))
 
-  create_histogram(v, col, file.path(output_dir, sprintf("yield_hist_%s.png", col)),
-                   unit = if (startsWith(col, "yield_")) "t/ha" else "fraction")
-  create_map(yields_geo, col, file.path(output_dir, sprintf("yield_map_%s.png", col)))
+  if (col %in% plot_cols) {
+    create_histogram(v, col, file.path(output_dir, sprintf("yield_hist_%s.png", col)),
+                     unit = if (startsWith(col, "yield_")) "t/ha" else "fraction")
+    create_map(yields_geo, col, file.path(output_dir, sprintf("yield_map_%s.png", col)))
+  }
 }
 
 yield_summary <- rbindlist(summary_rows)
+
+# ==============================================================================
+# SECTION 1b: ASSEMBLED CROPLAND CROSS-SECTION (Stage 1b)
+# ==============================================================================
+# Section 1 checks the per-sub-tile extraction. This checks what 1b made of it:
+# the consolidation can lose cells (a sub-tile that never ran) or gain NAs (a
+# grid cell with no extraction row) without either side looking wrong alone.
+# Skipped rather than failed when 1b has not run yet - 0c is validatable on its
+# own and the two stages are submitted separately.
+
+log_message("----------------------------------------")
+log_message("SECTION 1b: CROPLAND CROSS-SECTION")
+log_message("----------------------------------------")
+
+if (!file.exists(cropland_final_file)) {
+  log_message(sprintf("Not found, skipping: %s", cropland_final_file))
+  log_message("  (run code/bash/1b_assemble_cropland.sh to produce it)")
+} else {
+  meta_cols <- c("grid_id", "cropland_frac", "pasture_frac", "cropshare_total",
+                 "n_crops_present", "multicrop_index")
+  have <- intersect(meta_cols, names(arrow::read_parquet(cropland_final_file,
+                                                         as_data_frame = FALSE)))
+  cs <- setDT(arrow::read_parquet(cropland_final_file, col_select = all_of(have)))
+
+  log_message(sprintf("Loaded %s cells, %d summary columns",
+                      format(nrow(cs), big.mark = ","), ncol(cs)))
+
+  add_check("cropland", "rows", "non-empty", nrow(cs) > 0,
+            sprintf("%s rows", format(nrow(cs), big.mark = ",")))
+  add_check("cropland", "grid_id", "unique (one row per cell)",
+            !any(duplicated(cs$grid_id)),
+            sprintf("%d duplicated", sum(duplicated(cs$grid_id))))
+
+  # Every cell that Section 1 extracted must survive into the cross-section.
+  n_extracted <- length(unique(yields$grid_id))
+  n_covered   <- if ("cropshare_total" %in% names(cs)) cs[!is.na(cropshare_total), .N] else NA_integer_
+  add_check("cropland", "coverage", "all extracted cells carried through",
+            !is.na(n_covered) && n_covered >= n_extracted,
+            sprintf("%s of %s extracted cells have data",
+                    format(n_covered, big.mark = ","),
+                    format(n_extracted, big.mark = ",")))
+
+  for (col in intersect(c("cropland_frac", "pasture_frac"), names(cs))) {
+    v <- cs[[col]]; vv <- v[!is.na(v)]
+    add_check("cropland", col, "bounded in [0,1]",
+              length(vv) > 0 && min(vv) >= -1e-9 && max(vv) <= 1 + 1e-9,
+              sprintf("range [%.4f, %.4f]", min(vv), max(vv)))
+  }
+
+  if ("cropshare_total" %in% names(cs)) {
+    v <- cs$cropshare_total; vv <- v[!is.na(v)]
+    add_check("cropland", "cropshare_total", "non-negative",
+              min(vv) >= -1e-9, sprintf("min = %.6f", min(vv)))
+    # NOT bounded above by 1: EarthStat counts a hectare once per harvest, so
+    # double-cropped cells legitimately exceed it. Reported, not failed.
+    log_message(sprintf("  cropshare_total: median %.5f, max %.4f, %.2f%% of cells > 1",
+                        median(vv), max(vv), 100 * mean(vv > 1)))
+  }
+
+  if ("multicrop_index" %in% names(cs)) {
+    v <- cs$multicrop_index; vv <- v[is.finite(v)]
+    add_check("cropland", "multicrop_index", "finite where defined",
+              length(vv) > 0, sprintf("%s finite values",
+                                      format(length(vv), big.mark = ",")))
+    if (length(vv) > 0) {
+      log_message(sprintf("  multicrop_index: median %.3f, p99 %.3f (>1 = double-cropping)",
+                          median(vv), quantile(vv, 0.99)))
+    }
+  }
+
+  if ("n_crops_present" %in% names(cs)) {
+    log_message(sprintf("  n_crops_present: median %g, max %g",
+                        median(cs$n_crops_present, na.rm = TRUE),
+                        max(cs$n_crops_present, na.rm = TRUE)))
+  }
+  rm(cs); gc()
+}
 
 # ==============================================================================
 # SECTION 2: GFED BURNED AREA
@@ -299,9 +424,12 @@ cat(sprintf("Generated: %s\n", format(Sys.time())))
 cat(sprintf("Files: %d/%d   Rows: %s   Columns: %d\n\n",
             sum(yield_exists), N_SUB_TILES,
             format(nrow(yields), big.mark = ","), length(yield_cols)))
-print(yield_summary)
+# print.data.table truncates to head+tail past 100 rows. With 345 value columns
+# and ~1000 checks that would silently hide most of the report - the default was
+# harmless only while this stage produced 25 columns.
+print(yield_summary, nrows = Inf)
 cat("\nCHECKS\n")
-print(check_dt[dataset == "yields"])
+print(check_dt[dataset == "yields"], nrows = Inf)
 sink()
 
 g_path <- file.path(output_dir, "summary_gfed.txt")

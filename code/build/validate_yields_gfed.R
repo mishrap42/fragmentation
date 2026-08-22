@@ -10,9 +10,17 @@
 # (EarthStat, replacing GAEZ), new column naming (yield_* / cropshare_*), new
 # units. Three analysis scripts already consume those columns.
 #
+# Three sections: the Stage 0c sub-tile extraction, the Stage 1b assembled
+# cross-section (skipped if 1b has not run), and Stage 1a GFED.
+#
+# Numeric checks cover ALL columns. Plots cover a curated subset - the land-use
+# layers plus the top PLOT_TOP_N_CROPS crops by mean share - because the full
+# 172-crop extraction would otherwise emit ~690 PNGs and overrun the wall clock.
+# The skipped set is logged, never silently dropped.
+#
 # Outputs -> output/figures/yields_gfed/
 #   summary_yields.txt / summary_gfed.txt   per-column checks with PASS/FAIL
-#   yield_hist_<col>.png / yield_map_<col>.png
+#   yield_hist_<col>.png / yield_map_<col>.png   (curated subset)
 #   gfed_annual_timeseries.png / gfed_map_mean_annual.png / gfed_hist.png
 #
 # Usage: sbatch code/bash/validate_yields_gfed.sh
@@ -272,9 +280,13 @@ if (!file.exists(cropland_final_file)) {
 } else {
   meta_cols <- c("grid_id", "cropland_frac", "pasture_frac", "cropshare_total",
                  "n_crops_present", "multicrop_index")
-  have <- intersect(meta_cols, names(arrow::read_parquet(cropland_final_file,
-                                                         as_data_frame = FALSE)))
-  cs <- setDT(arrow::read_parquet(cropland_final_file, col_select = all_of(have)))
+  # col_select goes through tidyselect, which deprecates bare external vectors -
+  # a literal c(...) is fine but a variable warns. arrow re-exports all_of(), so
+  # this is warning-free and needs no extra dependency.
+  avail <- arrow::open_dataset(cropland_final_file, format = "parquet")$schema$names
+  have  <- intersect(meta_cols, avail)
+  cs <- setDT(arrow::read_parquet(cropland_final_file,
+                                  col_select = arrow::all_of(have)))
 
   log_message(sprintf("Loaded %s cells, %d summary columns",
                       format(nrow(cs), big.mark = ","), ncol(cs)))
@@ -430,6 +442,10 @@ cat(sprintf("Files: %d/%d   Rows: %s   Columns: %d\n\n",
 print(yield_summary, nrows = Inf)
 cat("\nCHECKS\n")
 print(check_dt[dataset == "yields"], nrows = Inf)
+if (any(check_dt$dataset == "cropland")) {
+  cat("\nCROPLAND CROSS-SECTION (Stage 1b)\n")
+  print(check_dt[dataset == "cropland"], nrows = Inf)
+}
 sink()
 
 g_path <- file.path(output_dir, "summary_gfed.txt")

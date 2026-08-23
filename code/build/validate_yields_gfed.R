@@ -31,7 +31,7 @@ source("code/build/BUILD_workspace.R")
 
 library(ggplot2)
 
-output_dir <- file.path(project_root, "output", "figures", "yields_gfed")
+output_dir <- file.path(project_root, "output", "validation", "yields_gfed")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 start_time <- Sys.time()

@@ -40,9 +40,9 @@
 #          Data/build/final/TMF_5km_cropland.parquet
 #          Data/lookup/{crop_price_preperiod,trucking_cost}.parquet
 #          Data/lookup/crop_crosswalk_earthstat_fao.csv
-# Outputs: output/figures/analysis/protection_logit/
-#            protection_logit.tex        spec ladder
-#            pressure_summary.txt        measure diagnostics
+# Outputs: output/analysis/
+#            protection_logit.tex        coefficients + dollar equivalents
+#            binscatter_pressure.png     binsreg, dots only
 #
 # Usage: Rscript code/analysis/6_protection_logit.R
 # ==============================================================================
@@ -53,13 +53,15 @@ suppressPackageStartupMessages({
   library(DBI)
   library(arrow)
   library(fixest)
+  library(ggplot2)
+  library(scales)
+  library(binsreg)
 })
 
 here::i_am('code/analysis/6_protection_logit.R')
 source("code/build/BUILD_workspace.R")
 
-output_dir <- file.path(project_root, "output", "figures", "analysis",
-                        "protection_logit")
+output_dir <- file.path(project_root, "output", "analysis", "protection_logit")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 FOREST_BASELINE_YEAR <- 1990
@@ -335,13 +337,17 @@ for (v in c("pressure_cell", "pressure_crop", "pressure_max")) {
 # travel_time_cities and dist_to_city_km are deliberately EXCLUDED from the
 # controls: tau_r is built from travel time, so conditioning on it absorbs the
 # transport leg of the very object being measured.
+#
+# CONTROLS ARE LINEAR, deliberately. The point of this table is the marginal
+# rate of substitution against the priced regressor: with x_k entering linearly,
+# -gamma_k / beta_p is read straight off as "dollars per hectare of forgone
+# agricultural profit that the planner behaves as if one extra unit of x_k is
+# worth". Under log(x_k) that ratio would be dollars per LOG POINT, which has no
+# natural unit and cannot be quoted per tCO2 or per metre.
+#
+# elevation enters raw for the same reason. The earlier asinh() guarded against
+# NaN from below-sea-level cells under log(x+1); linear needs no guard.
 
-# elevation enters as asinh, not log(x+1): the DEM carries below-sea-level cells
-# and log(elevation_m + 1) returns NaN for anything under -1 m, which fixest
-# drops as an NA. That silently removed ~660 observations in job 1476554 with
-# only a "NaNs produced" warning. asinh is defined on the whole line and behaves
-# like log for large positive values, so the transform is unchanged where it
-# matters.
 cv <- function() vcov_conley(lat = ~centroid_lat, lon = ~centroid_lon,
                              cutoff = CONLEY_KM)
 
@@ -354,65 +360,181 @@ m2 <- feglm(ever_protected ~ pressure_cell_100 | country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
 
 m3 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              terrain_ruggedness + asinh(elevation_m) +
-              log(pop_density_1990 + 1) | country_iso3, est,
+              elevation_m + pop_density_1990 | country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
 
 m4 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              terrain_ruggedness + asinh(elevation_m) +
-              log(pop_density_1990 + 1) + log(agc_2010 + 1) +
-              log(biodiv_thr + 1) | country_iso3, est,
+              elevation_m + pop_density_1990 + agc_2010 + biodiv_thr |
+              country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
 
-models <- list("Pooled" = m1, "+ country FE" = m2,
-               "+ cost side" = m3, "+ benefit side" = m4)
+# terrain_ruggedness is NOT in the ladder. With slope_degrees it produced
+# +0.254 / -0.535 in job 1476554 - equal and opposing coefficients on two
+# near-identical terrain measures, which is a collinearity artifact rather than
+# two findings, and it would have corrupted both dollar valuations. slope stays
+# because degrees are interpretable.
 
-etable(models, digits = 4)
-
-# Robustness: the cropland-normalized measure, where it exists.
-est_c <- est[is.finite(pressure_crop)]
-log_message(sprintf("pressure_crop defined on %s cells (%.1f%% of sample)",
-                    format(nrow(est_c), big.mark = ","),
-                    100 * nrow(est_c) / max(nrow(est), 1)))
-if (nrow(est_c) > 1000) {
-  m5 <- feglm(ever_protected ~ pressure_crop_100 + slope_degrees +
-                terrain_ruggedness + asinh(elevation_m) +
-                log(pop_density_1990 + 1) | country_iso3, est_c,
-              family = binomial(), weights = ~area_km2, vcov = cv())
-  etable(list("cropland-normalized" = m5), digits = 4)
+# Only m4 is tabulated. The ladder still matters for reading the attenuation,
+# so it goes to the log rather than into more files.
+log_message("Ladder, coefficient on agricultural profitability ($100/ha):")
+for (nm in c("(1) pooled", "(2) +country FE", "(3) +cost", "(4) +benefit")) {
+  mm <- list("(1) pooled" = m1, "(2) +country FE" = m2,
+             "(3) +cost" = m3, "(4) +benefit" = m4)[[nm]]
+  bb <- coef(mm)[["pressure_cell_100"]]
+  ss <- sqrt(vcov(mm)["pressure_cell_100", "pressure_cell_100"])
+  log_message(sprintf("  %-18s %8.4f  (SE %.4f, t %6.2f)", nm, bb, ss, bb / ss))
 }
 
 # ==============================================================================
-# 7. OUTPUT
+# 7. DOLLAR-EQUIVALENT VALUATIONS (marginal rate of substitution)
 # ==============================================================================
+# In  Pr(protect) = Lambda(alpha + beta_p * pressure + sum_k gamma_k x_k),
+# holding the index fixed:
+#
+#     beta_p * d(pressure) + gamma_k * dx_k = 0
+#     =>  d(pressure)/dx_k = -gamma_k / beta_p
+#
+# pressure is scaled in $100/ha, so multiplying by 100 gives USD/ha per unit of
+# x_k: the agricultural profit the siting process behaved as if it was willing
+# to forgo for one more unit of x_k. Revealed preference, not social value, and
+# only as credible as beta_p.
+#
+# Delta method on r = -gamma/beta:
+#   dr/dgamma = -1/beta ,  dr/dbeta = gamma/beta^2
+# The ratio blows up as beta_p -> 0, so beta_p's t is reported in the table.
 
-tex_path <- file.path(output_dir, "protection_logit.tex")
-etable(models, file = tex_path, replace = TRUE, digits = 4,
-       title = paste("Protection selection on \\$-denominated agricultural",
-                     "pressure (logit, area-weighted, Conley 50km SEs)"),
-       label = "tab:protection_logit")
-log_message(sprintf("Wrote %s", tex_path))
+dollar_equiv <- function(model, price_var = "pressure_cell_100", scale = 100) {
+  b  <- coef(model); V <- vcov(model)
+  bp <- b[[price_var]]; vp <- V[price_var, price_var]
 
-sum_path <- file.path(output_dir, "pressure_summary.txt")
-sink(sum_path)
-cat("PRESSURE MEASURE DIAGNOSTICS\n============================\n")
-cat(sprintf("Generated: %s\n\n", Sys.time()))
-cat(sprintf("Estimation sample: %s cells, %d countries, %.1f%% ever protected\n",
-            format(nrow(est), big.mark = ","), uniqueN(est$country_iso3),
-            100 * mean(est$ever_protected)))
-cat(sprintf("Crops priced: %d\n", nrow(xw)))
-cat(sprintf("pressure_cell exactly zero: %.1f%%\n", 100 * z))
-cat(sprintf("pressure_cell negative:     %.1f%%\n\n",
-            100 * est[, mean(pressure_cell < 0)]))
-cat("Yields are EarthStat ACTUAL (zero where the crop is not grown), so this\n")
-cat("measures demonstrated agricultural value, not agronomic potential.\n\n")
-print(est[, .(mean_pressure_cell = mean(pressure_cell),
-              mean_pressure_max  = mean(pressure_max, na.rm = TRUE),
-              mean_tau_r         = mean(tau_r, na.rm = TRUE),
-              n = .N),
-          by = .(ever_protected)])
-sink()
-log_message(sprintf("Wrote %s", sum_path))
+  rbindlist(lapply(setdiff(names(b), price_var), function(k) {
+    g <- b[[k]]; vg <- V[k, k]; cg <- V[k, price_var]
+    dg <- -1 / bp * scale
+    db <-  g / bp^2 * scale
+    data.table(term = k, usd_per_unit = -g / bp * scale,
+               se = sqrt(max(dg^2 * vg + db^2 * vp + 2 * dg * db * cg, 0)))
+  }))
+}
 
-log_message(sprintf("Completed in %.1f minutes",
-                    as.numeric(difftime(Sys.time(), start_time, units = "mins"))))
+de <- dollar_equiv(m4)
+
+# agc_2010 is above-ground biomass CARBON (tC/ha). tCO2 = tC * 44/12, so both
+# the coefficient and its dollar value are rescaled by 12/44 to read per tCO2 -
+# same convention as 5_protection_lpm.R's committed-carbon calculation.
+C_TO_CO2 <- 44 / 12
+de[term == "agc_2010", `:=`(usd_per_unit = usd_per_unit / C_TO_CO2,
+                            se           = se / C_TO_CO2)]
+
+# ------------------------------------------------------------------------------
+# Logit elasticity of the protection probability w.r.t. agricultural profit.
+#   p = Lambda(eta),  d p / d x = beta * p (1-p)
+#   elasticity = (d p / d x) * (x / p) = beta * x * (1 - p)
+# Evaluated at the area-weighted sample means, matching the estimation weights.
+# ------------------------------------------------------------------------------
+xbar_100 <- est[, weighted.mean(pressure_cell_100, area_km2)]
+pbar     <- est[, weighted.mean(ever_protected,    area_km2)]
+beta_p   <- coef(m4)[["pressure_cell_100"]]
+se_bp    <- sqrt(vcov(m4)["pressure_cell_100", "pressure_cell_100"])
+elast    <- beta_p * xbar_100 * (1 - pbar)
+elast_se <- abs(se_bp * xbar_100 * (1 - pbar))
+
+log_message("----------------------------------------")
+log_message(sprintf("beta_p = %.4f (t = %.2f)", beta_p, beta_p / se_bp))
+log_message(sprintf("elasticity of P(protect) wrt ag profit = %.4f (SE %.4f)",
+                    elast, elast_se))
+for (i in seq_len(nrow(de))) {
+  log_message(sprintf("  %-18s %10.2f  (SE %8.2f)  USD/ha",
+                      de$term[i], de$usd_per_unit[i], de$se[i]))
+}
+
+# ==============================================================================
+# 8. TABLE
+# ==============================================================================
+# ONE table. Column (1) is the fitted logit in raw units; column (2) is the same
+# row re-expressed as dollars per hectare of forgone agricultural profit. The
+# price variable is the numeraire, so it has no entry in (2).
+
+LABEL <- c(
+  pressure_cell_100 = "Agricultural profitability (\\$100/ha)",
+  slope_degrees     = "Slope (degrees)",
+  elevation_m       = "Elevation (m)",
+  pop_density_1990  = "Population density, 1990 (per km$^2$)",
+  agc_2010          = "Above-ground carbon (tCO$_2$/ha)",
+  biodiv_thr        = "Threatened species richness"
+)
+
+stars <- function(t) if (abs(t) > 2.576) "^{***}" else
+                     if (abs(t) > 1.960) "^{**}"  else
+                     if (abs(t) > 1.645) "^{*}"   else ""
+
+b4 <- coef(m4); v4 <- sqrt(diag(vcov(m4)))
+# report the carbon coefficient per tCO2 too, so (1) and (2) share a unit
+b_disp <- b4; s_disp <- v4
+b_disp["agc_2010"] <- b4[["agc_2010"]] / C_TO_CO2
+s_disp["agc_2010"] <- v4[["agc_2010"]] / C_TO_CO2
+
+tex <- file.path(output_dir, "protection_logit.tex")
+f <- file(tex, "w")
+cat("\\begin{table}[htbp]\n\\centering\n",
+    "\\caption{\\label{tab:protection_logit} Protected-area siting and agricultural profitability.",
+    " Column (1) is an area-weighted logit of ever-protected status on forested-at-baseline cells,",
+    " with country fixed effects and Conley (50 km) standard errors.",
+    " Column (2) re-expresses each coefficient as $-\\gamma_k/\\beta_p$, the agricultural profit per",
+    " hectare the siting process behaves as if it will forgo for one more unit of the attribute;",
+    " delta-method standard errors.}\n",
+    "\\begin{tabular}{lcc}\n\\toprule\n",
+    " & (1) & (2) \\\\\n",
+    " & Coefficient & \\$/ha equivalent \\\\\n\\midrule\n", sep = "", file = f)
+
+for (k in names(LABEL)) {
+  if (!k %in% names(b_disp)) next
+  t_k <- b_disp[[k]] / s_disp[[k]]
+  col1 <- sprintf("$%.4f%s$", b_disp[[k]], stars(t_k))
+  col2 <- if (k == "pressure_cell_100") "---" else {
+    r <- de[term == k]
+    sprintf("$%.2f$", r$usd_per_unit)
+  }
+  cat(sprintf("%s & %s & %s \\\\\n", LABEL[[k]], col1, col2), file = f)
+  se2 <- if (k == "pressure_cell_100") "" else
+           sprintf("(%.2f)", de[term == k, se])
+  cat(sprintf(" & (%.4f) & %s \\\\\n", s_disp[[k]], se2), file = f)
+}
+
+cat("\\midrule\n",
+    "Country fixed effects & Yes & \\\\\n",
+    sprintf("Observations & %s & \\\\\n", format(m4$nobs, big.mark = ",")),
+    sprintf("Pseudo $R^2$ & %.4f & \\\\\n", fitstat(m4, "pr2")$pr2),
+    "\\midrule\n",
+    sprintf("Elasticity of $\\Pr(\\text{protect})$ w.r.t. profit & $%.4f$ & \\\\\n", elast),
+    sprintf(" & (%.4f) & \\\\\n", elast_se),
+    "\\bottomrule\n\\end{tabular}\n\\end{table}\n", sep = "", file = f)
+close(f)
+log_message(sprintf("Wrote %s", tex))
+
+# ==============================================================================
+# 9. BINSCATTER
+# ==============================================================================
+# binsreg, dots only. It handles the 42.9% mass at zero itself: the repeated
+# knots collapse into a single dot and it warns which bins it dropped, which is
+# the honest treatment - equal-count quantile bins would otherwise scatter one
+# number across a third of the plot.
+
+X_LABEL <- "Agricultural profitability, $/ton"
+
+bsr <- binsreg(y = est$ever_protected, x = est$pressure_cell,
+               weights = est$area_km2, nbins = 20)
+dots <- as.data.table(bsr$data.plot[[1]]$data.dots)
+log_message(sprintf("binsreg returned %d dots (20 requested; repeated knots collapse the zero mass)",
+                    nrow(dots)))
+
+p <- ggplot(dots, aes(x = x, y = fit)) +
+  geom_point(colour = "steelblue", size = 2.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = X_LABEL, y = "Probability of protection") +
+  theme_classic(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+ggsave(file.path(output_dir, "binscatter_pressure.png"), p,
+       width = 6.5, height = 4.5, dpi = 300)
+log_message(sprintf("Wrote %s",
+                    file.path(output_dir, "binscatter_pressure.png")))

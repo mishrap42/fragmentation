@@ -265,7 +265,7 @@ final_plot <- plot_grid(
 # SAVE OUTPUT
 # ==============================================================================
 
-output_dir <- file.path(project_root, "output", "figures")
+output_dir <- file.path(project_root, "output", "validation", "wdpa_tmf")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 output_file <- file.path(output_dir, sprintf("wdpa_tmf_pa_%d.png", selected_pa))

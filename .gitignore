@@ -66,3 +66,7 @@ Data/
 # Keep the directory skeleton and small code-adjacent lookups
 !data/**/.gitkeep
 !data/lookup/
+
+# Generated outputs: figures, tables and summaries are reproducible from code.
+# See docs/FIGURE_ORGANIZATION.md
+output/

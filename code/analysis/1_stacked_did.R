@@ -81,7 +81,7 @@ eco_path    <- file.path(
              "/resnick/groups/MishraLab/GlobalForest/data/raw/spatial"),
   "ecoregions", "Ecoregions2017", "Ecoregions2017.shp")
 
-out_dir <- file.path(project_root, "output", "analysis")
+out_dir <- file.path(project_root, "output", "analysis", "stacked_did")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 log_lines <- c()

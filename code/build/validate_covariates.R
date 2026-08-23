@@ -21,7 +21,7 @@ args <- commandArgs(trailingOnly = TRUE)
 single_tile <- if (length(args) > 0) as.integer(args[1]) else NULL
 
 # Output directory (same as other visualization scripts)
-output_dir <- file.path(project_root, "output", "figures", "covariates")
+output_dir <- file.path(project_root, "output", "validation", "covariates")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 log_message("========================================")

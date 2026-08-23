@@ -27,7 +27,7 @@ cat("TMF PIPELINE VALIDATION (Chunked Processing)\n")
 cat(rep("=", 71), "\n", sep = "")
 
 # Create output directory
-output_dir <- file.path(project_root, "output", "validation")
+output_dir <- file.path(project_root, "output", "validation", "pipeline")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # ==============================================================================

@@ -199,7 +199,7 @@ p <- ggplot() +
 # SAVE OUTPUT
 # ==============================================================================
 
-output_dir <- file.path(project_root, "output", "figures")
+output_dir <- file.path(project_root, "output", "validation", "interior_frontier")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 output_file <- file.path(output_dir, "interior_frontier_map.png")

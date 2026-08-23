@@ -144,17 +144,48 @@ if (n_nocrop > 0.05 * nrow(dt)) {
 # 3. PRICES AND TRANSPORT COST
 # ==============================================================================
 
+# GADM assigns Z0x codes to disputed areas, and they carry no ISO3 economic
+# data. Z07 is labelled "India" and holds 2,985 forested cells; without a remap
+# it would take the global-median price AND the global-median tau despite India
+# having both observed. XPI / XSP / XCL are uninhabited islands (43 cells total,
+# no agriculture) and keep the fallback - not worth a judgement call.
+# country_econ is used ONLY for the price and tau joins; the fixed effect stays
+# on country_iso3 so the disputed area is not silently folded into India.
+GADM_ECON_REMAP <- c(Z07 = "IND")
+dt[, country_econ := country_iso3]
+dt[country_iso3 %in% names(GADM_ECON_REMAP),
+   country_econ := GADM_ECON_REMAP[country_iso3]]
+n_remap <- dt[country_econ != country_iso3, .N]
+if (n_remap > 0) {
+  log_message(sprintf("Remapped %s cells from GADM disputed codes for economic joins: %s",
+                      format(n_remap, big.mark = ","),
+                      paste(names(GADM_ECON_REMAP), "->", GADM_ECON_REMAP,
+                            collapse = ", ")))
+}
+
 stopifnot(file.exists(crop_price_pre_file), file.exists(crop_price_glb_file),
           file.exists(trucking_file))
 pre <- setDT(read_parquet(crop_price_pre_file))
 glb <- setDT(read_parquet(crop_price_glb_file))
 tau <- setDT(read_parquet(trucking_file))
 
-dt <- merge(dt, tau[, .(country_iso3, tau_usd_ton_km, tau_source)],
-            by = "country_iso3", all.x = TRUE)
+dt <- merge(dt, tau[, .(country_econ = country_iso3, tau_usd_ton_km, tau_source)],
+            by = "country_econ", all.x = TRUE)
+# A missing tau makes EVERY crop in the cell unpriceable, so the cell is dropped
+# by the n_crops_priced guard - silently removing whole countries. 0e now builds
+# tau over all ISO3 codes so this should be zero; the fallback keeps a stale
+# lookup table from deleting a country's worth of observations without saying so.
+n_notau <- dt[is.na(tau_usd_ton_km), .N]
 log_message(sprintf("Cells without a trucking price: %s (%.2f%%)",
-                    format(dt[is.na(tau_usd_ton_km), .N], big.mark = ","),
-                    100 * dt[is.na(tau_usd_ton_km), .N] / nrow(dt)))
+                    format(n_notau, big.mark = ","), 100 * n_notau / nrow(dt)))
+if (n_notau > 0) {
+  miss_ctry <- sort(unique(dt$country_econ[is.na(dt$tau_usd_ton_km)]))
+  log_message(sprintf("  WARNING: no tau for %d countries: %s",
+                      length(miss_ctry), paste(miss_ctry, collapse = ", ")))
+  log_message("  Falling back to the global median tau. Re-run 0e to fix properly.")
+  dt[is.na(tau_usd_ton_km), `:=`(tau_usd_ton_km = median(tau$tau_usd_ton_km, na.rm = TRUE),
+                                 tau_source = "global_median_fallback")]
+}
 
 # tau_r: USD per TONNE hauled out of this cell.
 dt[, tau_r := tau_usd_ton_km * travel_time_cities / 60]
@@ -172,18 +203,19 @@ price_w <- dcast(pre, country_iso3 ~ crop, value.var = "price_usd_t")
 # Country -> price-row index, resolved once. The earlier draft merged price_w
 # onto dt inside the crop loop, which reallocated a 2M-row, 100-column table 44
 # times; match() does the same join as a single integer index.
-ci        <- match(dt$country_iso3, price_w$country_iso3)
+ci        <- match(dt$country_econ, price_w$country_iso3)
 glb_price <- setNames(as.list(glb$price_usd_t), glb$crop)
 
 n_nocountry <- sum(is.na(ci))
 log_message(sprintf("Cells whose country has NO FAO price row: %s (%.1f%%) - %s",
                     format(n_nocountry, big.mark = ","),
                     100 * n_nocountry / nrow(dt),
-                    paste(sort(unique(dt$country_iso3[is.na(ci)])), collapse = ", ")))
+                    paste(sort(unique(dt$country_econ[is.na(ci)])), collapse = ", ")))
 log_message("  these fall back to the global median crop price")
 tau_r <- dt$tau_r
 n     <- nrow(dt)
 
+unpriced_crops <- character(0)    # crops with no price in any country
 press_cell <- numeric(n)          # sum_c s_cr * (p_c - tau_r) * y_cr
 press_max  <- rep(NA_real_, n)    # max_c (p_c - tau_r) * y_cr
 n_priced   <- integer(n)
@@ -193,13 +225,27 @@ for (i in seq_len(nrow(xw))) {
   if (!crop %in% names(price_w)) next
 
   p <- price_w[[crop]][ci]            # USD/t, country-specific
+
   # Coalesce onto the global median wherever the country reports no price at
   # all. COD, MMR, PNG and GAB are absent from FAOSTAT producer prices entirely
   # - four of the largest tropical-forest countries - and without this they
   # would enter with pressure = 0, which reads as "no agriculture" when it means
   # "no FAO submission". That missingness tracks state capacity, which tracks
   # protection, so the silent zero would bias beta directly.
-  p[is.na(p)] <- glb_price[[crop]]
+  #
+  # A crop can also have NO price anywhere: plantain is in EarthStat and in the
+  # crosswalk but FAOSTAT reports no producer price for it in any country, so
+  # glb_price[["plantain"]] is NULL. Assigning NULL into a subset is an error
+  # ("replacement has length zero"), which is what killed job 1447204. Such a
+  # crop contributes nothing to any cell, so skip it and record it.
+  gp <- glb_price[[crop]]
+  if (!is.null(gp) && is.finite(gp)) {
+    p[is.na(p)] <- gp
+  }
+  if (all(is.na(p))) {
+    unpriced_crops <- c(unpriced_crops, crop)
+    next
+  }
   y <- dt[[xw$yield_col[i]]]          # t/ha on the crop's harvested area
   s <- dt[[xw$cropshare_col[i]]]      # harvested area / cell area
 
@@ -211,6 +257,11 @@ for (i in seq_len(nrow(xw))) {
 
   # na.rm keeps the running max defined from the first non-NA crop onward.
   press_max <- pmax(press_max, pi_c, na.rm = TRUE)
+}
+
+if (length(unpriced_crops) > 0) {
+  log_message(sprintf("Crops with NO price in any country, excluded from pressure (%d): %s",
+                      length(unpriced_crops), paste(unpriced_crops, collapse = ", ")))
 }
 
 dt[, `:=`(pressure_cell  = press_cell,
@@ -285,6 +336,12 @@ for (v in c("pressure_cell", "pressure_crop", "pressure_max")) {
 # controls: tau_r is built from travel time, so conditioning on it absorbs the
 # transport leg of the very object being measured.
 
+# elevation enters as asinh, not log(x+1): the DEM carries below-sea-level cells
+# and log(elevation_m + 1) returns NaN for anything under -1 m, which fixest
+# drops as an NA. That silently removed ~660 observations in job 1476554 with
+# only a "NaNs produced" warning. asinh is defined on the whole line and behaves
+# like log for large positive values, so the transform is unchanged where it
+# matters.
 cv <- function() vcov_conley(lat = ~centroid_lat, lon = ~centroid_lon,
                              cutoff = CONLEY_KM)
 
@@ -297,12 +354,12 @@ m2 <- feglm(ever_protected ~ pressure_cell_100 | country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
 
 m3 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              terrain_ruggedness + log(elevation_m + 1) +
+              terrain_ruggedness + asinh(elevation_m) +
               log(pop_density_1990 + 1) | country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
 
 m4 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              terrain_ruggedness + log(elevation_m + 1) +
+              terrain_ruggedness + asinh(elevation_m) +
               log(pop_density_1990 + 1) + log(agc_2010 + 1) +
               log(biodiv_thr + 1) | country_iso3, est,
             family = binomial(), weights = ~area_km2, vcov = cv())
@@ -319,7 +376,7 @@ log_message(sprintf("pressure_crop defined on %s cells (%.1f%% of sample)",
                     100 * nrow(est_c) / max(nrow(est), 1)))
 if (nrow(est_c) > 1000) {
   m5 <- feglm(ever_protected ~ pressure_crop_100 + slope_degrees +
-                terrain_ruggedness + log(elevation_m + 1) +
+                terrain_ruggedness + asinh(elevation_m) +
                 log(pop_density_1990 + 1) | country_iso3, est_c,
               family = binomial(), weights = ~area_km2, vcov = cv())
   etable(list("cropland-normalized" = m5), digits = 4)

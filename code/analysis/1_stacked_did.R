@@ -44,7 +44,14 @@ suppressMessages({
 # CONFIG
 # ------------------------------------------------------------------------------
 
-OUTCOME        <- Sys.getenv("DID_OUTCOME", "forest_cover")
+# Both outcomes are run in ONE pass and written to outcome-suffixed filenames,
+# so neither overwrites the other and every run produces the full set.
+#   forest_cover     Undisturbed + Degraded + Regrowth  (forest EXTENT)
+#   Undisturbed_TMF  undisturbed only                   (forest QUALITY)
+# The pair is the substantive comparison: extent holding while undisturbed
+# falls is degradation inside a protected boundary.
+OUTCOMES       <- trimws(strsplit(Sys.getenv("DID_OUTCOMES",
+                    "forest_cover,Undisturbed_TMF"), ",")[[1]])
 PRETREND_VAR   <- Sys.getenv("DID_PRETREND_VAR", "Deforested")
 EVENT_MIN      <- as.integer(Sys.getenv("DID_EVENT_MIN", "-10"))
 EVENT_MAX      <- as.integer(Sys.getenv("DID_EVENT_MAX", "10"))
@@ -84,8 +91,9 @@ say <- function(...) {
 }
 
 say("Panel: %s", panel_path)
-say("Outcome: %s | event window [%d, %d] | control cap %s/cohort",
-    OUTCOME, EVENT_MIN, EVENT_MAX, format(CONTROL_CAP, big.mark = ","))
+say("Outcomes: %s | event window [%d, %d] | control cap %s/cohort",
+    paste(OUTCOMES, collapse = ", "), EVENT_MIN, EVENT_MAX,
+    format(CONTROL_CAP, big.mark = ","))
 
 # Time-invariant characteristics for the balance table.
 # Stage 1b moved the crop/yield variables out of the panel into a cell-level
@@ -301,10 +309,12 @@ say("Pulling outcome panel for %s distinct cells...", format(length(needed), big
 
 dbWriteTable(con, "needed_cells", data.frame(grid_id = needed), overwrite = TRUE)
 panel <- as.data.table(dbGetQuery(con, sprintf("
-  SELECT p.grid_id, p.year, p.%s AS y, p.%s AS pretrend_y
+  SELECT p.grid_id, p.year, %s, p.%s AS pretrend_y
   FROM read_parquet('%s') p
   INNER JOIN needed_cells n ON p.grid_id = n.grid_id
-  WHERE p.year IS NOT NULL", OUTCOME, PRETREND_VAR, panel_path)))
+  WHERE p.year IS NOT NULL",
+  paste(sprintf("p.%s AS %s", OUTCOMES, OUTCOMES), collapse = ", "),
+  PRETREND_VAR, panel_path)))
 say("  %s cell-year rows", format(nrow(panel), big.mark = ","))
 
 dbDisconnect(con, shutdown = TRUE)
@@ -332,113 +342,121 @@ say("Units dropped for missing t = -1: %s of %s",
 # RAW TRENDS: remove the ID x cohort intercept at t = -1
 # ------------------------------------------------------------------------------
 
-say("Building raw trends...")
-stk[, y_ref := y[rel_year == -1][1], by = id_cohort]
-stk[, y_norm := y - y_ref]
-
-trends <- stk[, .(mean_y = mean(y_norm, na.rm = TRUE),
-                  se = sd(y_norm, na.rm = TRUE) / sqrt(.N),
-                  n = .N),
-              by = .(rel_year, treated)]
-trends[, group := fifelse(treated == 1L, "Treated (PA designated)", "Never treated")]
-setorder(trends, treated, rel_year)
-
-p_raw <- ggplot(trends, aes(x = rel_year, y = mean_y, colour = group, fill = group)) +
-  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
-  geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3, colour = "grey40") +
-  geom_ribbon(aes(ymin = mean_y - 1.96 * se, ymax = mean_y + 1.96 * se),
-              alpha = 0.15, colour = NA) +
-  geom_line(linewidth = 0.9) + geom_point(size = 1.6) +
-  scale_colour_manual(values = c("Treated (PA designated)" = "steelblue",
-                                 "Never treated" = "grey35")) +
-  scale_fill_manual(values = c("Treated (PA designated)" = "steelblue",
-                               "Never treated" = "grey35")) +
-  labs(x = "Years since designation",
-       y = sprintf("%s, normalised to t = -1", OUTCOME),
-       title = "Raw trends, stacked by cohort",
-       subtitle = sprintf("ID x cohort intercept removed at t = -1; controls never treated, same country x biome"),
-       colour = NULL, fill = NULL) +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-        panel.grid.minor = element_blank())
-
-ggsave(file.path(out_dir, "raw_trends_stacked.png"), p_raw,
-       width = 9, height = 5.5, dpi = 200, bg = "white")
-fwrite(trends, file.path(out_dir, "raw_trends_stacked.csv"))
-say("  wrote raw_trends_stacked.png / .csv")
-
-# ------------------------------------------------------------------------------
-# DIFFERENCE-IN-DIFFERENCES
-#   (1) ID x cohort FE + cohort x year FE
-#   (2) ID x cohort FE + cohort x biome x year FE
-# ------------------------------------------------------------------------------
-
-say("Estimating DiD...")
-say("  clustering on country x biome: %d clusters", uniqueN(stk$cb))
 stk <- merge(stk, cell_attr[, .(grid_id, biome, country_iso3, cb)], by = "grid_id", all.x = TRUE)
 stk[, post := as.integer(rel_year >= 0)]
 stk[, treat_post := treated * post]
 
-# Clustered on country x biome, the stratum controls are drawn from. NOT on
-# grid_id: treatment is assigned at the protected area, so every cell in a PA
-# flips together and cell-level clustering would treat thousands of mechanically
-# identical observations as independent (Moulton). Country x biome absorbs both
-# the within-PA correlation and the spatial correlation among neighbouring
-# control cells.
-m_static_1 <- feols(y ~ treat_post | id_cohort + cohort^year,
-                    data = stk, cluster = ~cb, lean = TRUE)
-m_static_2 <- feols(y ~ treat_post | id_cohort + cohort^biome^year,
-                    data = stk, cluster = ~cb, lean = TRUE)
+for (OUTCOME in OUTCOMES) {
+  say("--- outcome: %s ---", OUTCOME)
+    stk[, y := get(OUTCOME)]
+    say("Building raw trends...")
+  stk[, y_ref := y[rel_year == -1][1], by = id_cohort]
+  stk[, y_norm := y - y_ref]
 
-m_dyn_1 <- feols(y ~ i(rel_year, treated, ref = -1) | id_cohort + cohort^year,
-                 data = stk, cluster = ~cb)
-m_dyn_2 <- feols(y ~ i(rel_year, treated, ref = -1) | id_cohort + cohort^biome^year,
-                 data = stk, cluster = ~cb)
+  trends <- stk[, .(mean_y = mean(y_norm, na.rm = TRUE),
+                    se = sd(y_norm, na.rm = TRUE) / sqrt(.N),
+                    n = .N),
+                by = .(rel_year, treated)]
+  trends[, group := fifelse(treated == 1L, "Treated (PA designated)", "Never treated")]
+  setorder(trends, treated, rel_year)
 
-etable(m_static_1, m_static_2,
-       file = file.path(out_dir, "did_estimates.tex"), replace = TRUE,
-       title = "Stacked difference-in-differences: effect of PA designation",
-       style.tex = style.tex("aer"),
-       dict = c(treat_post = "Treated $\\times$ Post", y = OUTCOME,
-                id_cohort = "ID $\\times$ cohort", `cohort^year` = "Cohort $\\times$ year",
-                `cohort^biome^year` = "Cohort $\\times$ biome $\\times$ year"))
-say("  wrote did_estimates.tex")
+  p_raw <- ggplot(trends, aes(x = rel_year, y = mean_y, colour = group, fill = group)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
+    geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3, colour = "grey40") +
+    geom_ribbon(aes(ymin = mean_y - 1.96 * se, ymax = mean_y + 1.96 * se),
+                alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.6) +
+    scale_colour_manual(values = c("Treated (PA designated)" = "steelblue",
+                                   "Never treated" = "grey35")) +
+    scale_fill_manual(values = c("Treated (PA designated)" = "steelblue",
+                                 "Never treated" = "grey35")) +
+    labs(x = "Years since designation",
+         y = sprintf("%s, normalised to t = -1", OUTCOME),
+         title = "Raw trends, stacked by cohort",
+         subtitle = sprintf("ID x cohort intercept removed at t = -1; controls never treated, same country x biome"),
+         colour = NULL, fill = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
 
-dyn <- rbindlist(lapply(list(`Cohort x year` = m_dyn_1,
-                             `Cohort x biome x year` = m_dyn_2), function(m) {
-  ct <- as.data.table(coeftable(m), keep.rownames = "term")
-  ct <- ct[grepl("rel_year::", term)]
-  ct[, rel_year := as.integer(sub(".*rel_year::(-?\\d+).*", "\\1", term))]
-  ct[, .(rel_year, est = Estimate, se = `Std. Error`)]
-}), idcol = "spec")
-dyn <- rbind(dyn, data.table(spec = unique(dyn$spec), rel_year = -1, est = 0, se = 0))
+  ggsave(file.path(out_dir, sprintf("raw_trends_stacked_%s.png", OUTCOME)), p_raw,
+         width = 9, height = 5.5, dpi = 200, bg = "white")
+  fwrite(trends, file.path(out_dir, sprintf("raw_trends_stacked_%s.csv", OUTCOME)))
+  say("  wrote raw_trends_stacked_%s.png / .csv", OUTCOME)
 
-p_es <- ggplot(dyn, aes(x = rel_year, y = est, colour = spec)) +
-  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
-  geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3, colour = "grey40") +
-  geom_linerange(aes(ymin = est - 1.96 * se, ymax = est + 1.96 * se),
-                 position = position_dodge(width = 0.4)) +
-  geom_point(position = position_dodge(width = 0.4), size = 1.8) +
-  scale_colour_manual(values = c("Cohort x year" = "steelblue",
-                                 "Cohort x biome x year" = "darkorange")) +
-  labs(x = "Years since designation", y = sprintf("Effect on %s", OUTCOME),
-       title = "Stacked event study", colour = NULL) +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-        panel.grid.minor = element_blank())
+  # ------------------------------------------------------------------------------
+  # DIFFERENCE-IN-DIFFERENCES
+  #   (1) ID x cohort FE + cohort x year FE
+  #   (2) ID x cohort FE + cohort x biome x year FE
+  # ------------------------------------------------------------------------------
 
-ggsave(file.path(out_dir, "event_study_stacked.png"), p_es,
-       width = 9, height = 5.5, dpi = 200, bg = "white")
-fwrite(dyn, file.path(out_dir, "event_study_stacked.csv"))
-say("  wrote event_study_stacked.png / .csv")
+  say("Estimating DiD...")
+  # Logged AFTER the merge that creates cb. Reported before it, uniqueN(NULL)
+  # printed "0 clusters" and looked like a broken clustering variable.
+  say("  clustering on country x biome: %d clusters (%s rows with NA cb)",
+      uniqueN(stk$cb), format(sum(is.na(stk$cb)), big.mark = ","))
 
-# ------------------------------------------------------------------------------
-# BALANCE TABLE: treated vs never-treated
-#
-# Time-invariant characteristics, plus the pre-treatment 5-year trend in
-# deforestation. Units without at least MIN_PRE_YEARS pre-period observations
-# are dropped from the trend row only, not from the rest of the table.
-# ------------------------------------------------------------------------------
+  # Clustered on country x biome, the stratum controls are drawn from. NOT on
+  # grid_id: treatment is assigned at the protected area, so every cell in a PA
+  # flips together and cell-level clustering would treat thousands of mechanically
+  # identical observations as independent (Moulton). Country x biome absorbs both
+  # the within-PA correlation and the spatial correlation among neighbouring
+  # control cells.
+  m_static_1 <- feols(y ~ treat_post | id_cohort + cohort^year,
+                      data = stk, cluster = ~cb, lean = TRUE)
+  m_static_2 <- feols(y ~ treat_post | id_cohort + cohort^biome^year,
+                      data = stk, cluster = ~cb, lean = TRUE)
+
+  m_dyn_1 <- feols(y ~ i(rel_year, treated, ref = -1) | id_cohort + cohort^year,
+                   data = stk, cluster = ~cb)
+  m_dyn_2 <- feols(y ~ i(rel_year, treated, ref = -1) | id_cohort + cohort^biome^year,
+                   data = stk, cluster = ~cb)
+
+  etable(m_static_1, m_static_2,
+         file = file.path(out_dir, sprintf("did_estimates_%s.tex", OUTCOME)), replace = TRUE,
+         title = "Stacked difference-in-differences: effect of PA designation",
+         style.tex = style.tex("aer"),
+         dict = c(treat_post = "Treated $\\times$ Post", y = OUTCOME,
+                  id_cohort = "ID $\\times$ cohort", `cohort^year` = "Cohort $\\times$ year",
+                  `cohort^biome^year` = "Cohort $\\times$ biome $\\times$ year"))
+  say("  wrote did_estimates_%s.tex", OUTCOME)
+
+  dyn <- rbindlist(lapply(list(`Cohort x year` = m_dyn_1,
+                               `Cohort x biome x year` = m_dyn_2), function(m) {
+    ct <- as.data.table(coeftable(m), keep.rownames = "term")
+    ct <- ct[grepl("rel_year::", term)]
+    ct[, rel_year := as.integer(sub(".*rel_year::(-?\\d+).*", "\\1", term))]
+    ct[, .(rel_year, est = Estimate, se = `Std. Error`)]
+  }), idcol = "spec")
+  dyn <- rbind(dyn, data.table(spec = unique(dyn$spec), rel_year = -1, est = 0, se = 0))
+
+  p_es <- ggplot(dyn, aes(x = rel_year, y = est, colour = spec)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
+    geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3, colour = "grey40") +
+    geom_linerange(aes(ymin = est - 1.96 * se, ymax = est + 1.96 * se),
+                   position = position_dodge(width = 0.4)) +
+    geom_point(position = position_dodge(width = 0.4), size = 1.8) +
+    scale_colour_manual(values = c("Cohort x year" = "steelblue",
+                                   "Cohort x biome x year" = "darkorange")) +
+    labs(x = "Years since designation", y = sprintf("Effect on %s", OUTCOME),
+         title = "Stacked event study", colour = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
+
+  ggsave(file.path(out_dir, sprintf("event_study_stacked_%s.png", OUTCOME)), p_es,
+         width = 9, height = 5.5, dpi = 200, bg = "white")
+  fwrite(dyn, file.path(out_dir, sprintf("event_study_stacked_%s.csv", OUTCOME)))
+  say("  wrote event_study_stacked_%s.png / .csv", OUTCOME)
+
+  # ------------------------------------------------------------------------------
+  # BALANCE TABLE: treated vs never-treated
+  #
+  # Time-invariant characteristics, plus the pre-treatment 5-year trend in
+  # deforestation. Units without at least MIN_PRE_YEARS pre-period observations
+  # are dropped from the trend row only, not from the rest of the table.
+  # ------------------------------------------------------------------------------
+}
 
 say("Building balance table...")
 

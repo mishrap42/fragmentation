@@ -184,7 +184,19 @@ log_message(sprintf("  %d countries with an observed trucking price",
 # then continent-median; there is no contiguity table in this repo, so this does
 # continent-median then global-median and records which. Coarser, and stated as
 # such rather than presented as the same procedure.
-tau <- merge(CJ(country_iso3 = countries), truck, by = "country_iso3", all.x = TRUE)
+#
+# The grid is EVERY ISO3 country, not just the ones FAOSTAT prices. Building it
+# from `countries` (the FAO list) left 41 countries with no tau row at all -
+# 11.9% of panel cells, including COD's 96,479 - and a missing tau makes every
+# crop in the cell unpriceable, so those cells drop out of the regression
+# entirely. Prices survive that case through the global-median fallback; tau had
+# no equivalent. Same failure, different column.
+all_iso3 <- sort(unique(c(countries, countrycode::codelist$iso3c)))
+all_iso3 <- all_iso3[!is.na(all_iso3)]
+log_message(sprintf("  Building tau over %d ISO3 codes (%d from FAO prices)",
+                    length(all_iso3), length(countries)))
+
+tau <- merge(CJ(country_iso3 = all_iso3), truck, by = "country_iso3", all.x = TRUE)
 tau[, continent := suppressWarnings(countrycode(country_iso3, "iso3c", "continent"))]
 
 tau[, tau_continent := median(tau_usd_ton_km, na.rm = TRUE), by = continent]
@@ -202,6 +214,7 @@ for (src in c("observed", "continent_median", "global_median")) {
 }
 log_message(sprintf("  tau range: %.4f - %.4f USD/ton-km",
                     min(tau$tau_usd_ton_km), max(tau$tau_usd_ton_km)))
+stopifnot(!any(is.na(tau$tau_usd_ton_km)))
 
 # ==============================================================================
 # WRITE

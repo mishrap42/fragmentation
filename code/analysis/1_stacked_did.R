@@ -37,6 +37,7 @@ suppressMessages({
   library(fixest)
   library(ggplot2)
   library(sf)
+  library(arrow)   # reading the Stage 1b cropland cross-section
 })
 
 # ------------------------------------------------------------------------------
@@ -63,6 +64,10 @@ project_root <- if (Sys.getenv("SLURM_SUBMIT_DIR") != "") {
 } else here::here()
 
 panel_path  <- file.path(project_root, "Data/build/final/TMF_5km_panel.parquet")
+# Stage 1b cross-section. Defined here rather than by sourcing BUILD_workspace.R,
+# which pulls in sf/terra/exactextractr and the whole build-side path set that
+# this analysis script does not otherwise need.
+cropland_final_file <- file.path(project_root, "Data/build/final/TMF_5km_cropland.parquet")
 biome_cache <- file.path(project_root, "Data/build/final/grid_biome.parquet")
 eco_path    <- file.path(
   Sys.getenv("FRAG_SPATIAL",
@@ -83,14 +88,27 @@ say("Outcome: %s | event window [%d, %d] | control cap %s/cohort",
     OUTCOME, EVENT_MIN, EVENT_MAX, format(CONTROL_CAP, big.mark = ","))
 
 # Time-invariant characteristics for the balance table.
-BAL_VARS <- c(
+# Stage 1b moved the crop/yield variables out of the panel into a cell-level
+# cross-section (TMF_5km_cropland.parquet), joined on grid_id. The panel now
+# carries 57 columns and none of the 172-crop set, so the two groups are read
+# from different files and merged below. Asking DuckDB for yield_maize against
+# the panel is what killed job 1447010:
+#   Binder Error: Referenced column "yield_maize" not found in FROM clause!
+BAL_VARS_PANEL <- c(
   "elevation_m", "slope_degrees", "terrain_ruggedness", "frac_slope_gt15",
   "dist_to_city_km", "travel_time_cities", "travel_time_ports",
   "pop_density_1990", "pop_access_50km",
   "aboveground_biomass_carbon_2010", "biomass_access_50km",
-  "yield_maize", "cropshare_maize", "cattle_density_2010_da",
+  "cattle_density_2010_da",
   "biodiv_combined_thr_sr_2022", "biodiv_rsr_crenvu",
   "area_km2")
+
+# From the cropland cross-section. cropland_frac / cropshare_total summarise
+# agricultural pressure better than any single crop now that 172 are available;
+# yield_maize is kept as the one crop-productivity proxy.
+BAL_VARS_CROP <- c("cropland_frac", "pasture_frac", "cropshare_total", "yield_maize")
+
+BAL_VARS <- c(BAL_VARS_PANEL, BAL_VARS_CROP)
 
 # Variables reported as percentiles of the pooled (treated + control)
 # distribution rather than in native units. Range-size rarity is a sum of
@@ -108,7 +126,8 @@ BAL_LABELS <- c(
   pop_access_50km = "Population access, 50km",
   aboveground_biomass_carbon_2010 = "Aboveground biomass C, 2010",
   biomass_access_50km = "Biomass access, 50km",
-  yield_maize = "Maize yield (t/ha)", cropshare_maize = "Maize cropland share",
+  cropland_frac = "Cropland share of cell", pasture_frac = "Pasture share of cell",
+  cropshare_total = "Harvested area / cell area", yield_maize = "Maize yield (t/ha)",
   cattle_density_2010_da = "Cattle density, 2010",
   biodiv_combined_thr_sr_2022 = "Threatened species richness",
   biodiv_rsr_crenvu = "Range-size rarity (CR/EN/VU), pctile",
@@ -176,7 +195,7 @@ if (file.exists(biome_cache)) {
 
 say("Loading cell attributes...")
 
-attr_cols <- paste(sprintf("any_value(%s) AS %s", BAL_VARS, BAL_VARS), collapse = ",\n    ")
+attr_cols <- paste(sprintf("any_value(%s) AS %s", BAL_VARS_PANEL, BAL_VARS_PANEL), collapse = ",\n    ")
 cell_attr <- as.data.table(dbGetQuery(con, sprintf("
   SELECT grid_id,
          any_value(country_iso3)                       AS country_iso3,
@@ -186,6 +205,26 @@ cell_attr <- as.data.table(dbGetQuery(con, sprintf("
   FROM read_parquet('%s')
   WHERE year IS NOT NULL
   GROUP BY grid_id", attr_cols, panel_path)))
+
+# Attach the crop variables from the Stage 1b cross-section.
+if (file.exists(cropland_final_file)) {
+  crop_avail <- arrow::open_dataset(cropland_final_file, format = "parquet")$schema$names
+  crop_want  <- intersect(BAL_VARS_CROP, crop_avail)
+  if (length(crop_want) < length(BAL_VARS_CROP)) {
+    say("  WARNING: absent from the cropland cross-section: %s",
+        paste(setdiff(BAL_VARS_CROP, crop_avail), collapse = ", "))
+  }
+  crop_dt <- as.data.table(arrow::read_parquet(
+    cropland_final_file, col_select = arrow::all_of(c("grid_id", crop_want))))
+  say("  cropland cross-section: %s cells, %d crop variables",
+      format(nrow(crop_dt), big.mark = ","), length(crop_want))
+  cell_attr <- merge(cell_attr, crop_dt, by = "grid_id", all.x = TRUE)
+  rm(crop_dt)
+} else {
+  say("  WARNING: %s not found; crop variables dropped from the balance table",
+      basename(cropland_final_file))
+  BAL_VARS <- BAL_VARS_PANEL
+}
 
 cell_attr <- merge(cell_attr, biome_dt, by = "grid_id", all.x = TRUE)
 cell_attr <- cell_attr[!is.na(biome) & !is.na(country_iso3)]

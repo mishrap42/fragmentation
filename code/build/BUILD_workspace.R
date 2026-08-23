@@ -84,6 +84,35 @@ yields_path <- file.path(earthstat_path,
 cropland_raster_path <- file.path(earthstat_path, 'Cropland2000_5m.tif')
 pasture_raster_path  <- file.path(earthstat_path, 'Pasture2000_5m.tif')
 
+# ------------------------------------------------------------------------------
+# Non-spatial economic inputs, shared with the Global Forest Repo. spatial_path
+# points at .../data/raw/spatial, so non-spatial is its sibling. Read-only here:
+# this project consumes those files, the companion owns them.
+# ------------------------------------------------------------------------------
+gf_nonspatial_path <- file.path(dirname(spatial_path), 'non-spatial')
+
+# FAOSTAT producer prices. 2022 vintage: annual, Y1991-Y2021, and it uses the
+# PRE-2021-CPC item names ("Rice, paddy", "Oil, palm"), which is why the crop
+# crosswalk carries fao_item_legacy alongside fao_item_current. Join on legacy.
+fao_prices_path <- file.path(gf_nonspatial_path, 'prices',
+                             'Prices_E_All_Data_NOFLAG.csv')
+
+# Country trucking price, USD per ton-km, read off Figures 1.6/1.7 of the World
+# Bank's "Shrinking Economic Distance". Coarse by construction - it is a
+# country-level scalar, so it moves no within-country variation.
+trucking_cost_path <- file.path(gf_nonspatial_path, 'trade costs',
+                                'SED Trucking Cost', 'worldbank_chatgpt_extract.csv')
+
+# Hand-maintained lookups owned by THIS repo (version-controlled, not derived).
+lookup_path <- file.path(project_root, "Data", "lookup")
+crop_crosswalk_file <- file.path(lookup_path, "crop_crosswalk_earthstat_fao.csv")
+
+# Derived economic tables written by 0e_prepare_crop_prices.R
+crop_prices_file    <- file.path(lookup_path, "fao_crop_prices.parquet")
+crop_price_pre_file <- file.path(lookup_path, "crop_price_preperiod.parquet")
+crop_price_glb_file <- file.path(lookup_path, "crop_price_global.parquet")
+trucking_file       <- file.path(lookup_path, "trucking_cost.parquet")
+
 # Covariate data paths (static covariates for Stage 5)
 cities_path <- file.path(spatial_path, "cities", "cityLocations.csv")
 # The GHS_POP_E#### folders sit inside GHSL/, and the extractor scans exactly
@@ -136,7 +165,7 @@ cropland_final_file <- file.path(final_output_path, "TMF_5km_cropland.parquet")
 sapply(c(grid_output_path, tmf_output_path, consolidated_path,
          classification_path, wdpa_output_path, yields_output_path,
          covariates_output_path, final_output_path, gfed_output_path,
-         gfed_consolidated_path),
+         gfed_consolidated_path, lookup_path),
        function(p) if(!dir.exists(p)) dir.create(p, recursive = TRUE))
 
 # ==============================================================================

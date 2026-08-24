@@ -1,12 +1,12 @@
 #!/bin/bash -l
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --job-name=PROT_LOGIT
 #SBATCH --account=mishralab
 #SBATCH --partition=expansion
 #SBATCH --qos=normal
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --mem=128G
+#SBATCH --mem=180G
 #SBATCH --output=LOGS/%x.%A.out
 #SBATCH --error=LOGS/%x.%A.err
 
@@ -20,9 +20,12 @@
 #   - protection_logit.tex   (spec ladder)
 #   - pressure_summary.txt   (measure diagnostics)
 #
-# Memory: 128G rather than the LPM's 64G. This job holds the ~2M-cell collapse
+# Memory: 180G rather than the LPM's 64G. This job holds the ~2M-cell collapse
 # AND the 44-crop slice of the cropland cross-section (88 float columns) at the
-# same time, which the LPM does not.
+# same time, which the LPM does not. Raised from 128G, and walltime 3h -> 6h,
+# when the heterogeneity section was added: it fits ten models with Conley SEs
+# rather than five, and the country-interacted model carries ~100 extra
+# coefficients.
 #
 # Prerequisites, in order:
 #   Stage 0c  -> Data/build/yields/*.parquet

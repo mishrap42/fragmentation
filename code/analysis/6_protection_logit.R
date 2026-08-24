@@ -40,6 +40,10 @@
 #          Data/build/final/TMF_5km_cropland.parquet
 #          Data/lookup/{crop_price_preperiod,trucking_cost}.parquet
 #          Data/lookup/crop_crosswalk_earthstat_fao.csv
+#
+# SAMPLE: forested-at-baseline cells NOT already protected by 2000. Designations
+# on or before 2000 predate the 1991-2000 price window and are dropped, so the
+# regressor always precedes the decision it is meant to explain.
 # Outputs: output/analysis/
 #            protection_logit.tex        coefficients + dollar equivalents
 #            binscatter_pressure.png     binsreg, dots only
@@ -56,6 +60,8 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(scales)
   library(binsreg)
+  library(sf)
+  library(rnaturalearth)
 })
 
 here::i_am('code/analysis/6_protection_logit.R')
@@ -103,7 +109,9 @@ query <- sprintf("
     ANY_VALUE(aboveground_biomass_carbon_2010)           AS agc_2010,
     ANY_VALUE(biodiv_combined_thr_sr_2022)               AS biodiv_thr,
     ANY_VALUE(cattle_density_2010_da)                    AS cattle_density,
-    MAX(CASE WHEN year = %d THEN Undisturbed_TMF END)    AS undist_base
+    MAX(CASE WHEN year = %d THEN Undisturbed_TMF END)    AS undist_base,
+    MAX(CASE WHEN year = 1990 THEN forest_cover END)      AS fc_1990,
+    MAX(CASE WHEN year = 2000 THEN forest_cover END)      AS fc_2000
   FROM read_parquet('%s')
   GROUP BY grid_id", FOREST_BASELINE_YEAR, panel_path)
 
@@ -288,6 +296,19 @@ for (v in c("pressure_cell", "pressure_crop", "pressure_max")) {
 
 dt[, forested_base := !is.na(undist_base) & undist_base > FOREST_THRESHOLD]
 
+# ------------------------------------------------------------------------------
+# Pre-period forest state, both in PERCENTAGE POINTS so the dollar equivalents
+# read per pp rather than per unit-share.
+#   forest_1990_pp   forest cover at the start of the window
+#   defor_9000_pp    forest cover LOST over 1990-2000; positive = loss
+# Both are measured entirely before DESIG_CUTOFF, so they precede every
+# designation in the estimation sample and are not post-treatment. They are
+# still endogenous in the weaker sense that prior clearing and future protection
+# share unobserved drivers - they absorb variation, they do not identify it.
+# ------------------------------------------------------------------------------
+dt[, forest_1990_pp := fc_1990 * 100]
+dt[, defor_9000_pp  := (fc_1990 - fc_2000) * 100]
+
 # n_crops_priced == 0 means NOTHING was priced for this cell, so pressure_cell
 # is a structural zero rather than a measured one. The global fallback above
 # should make this empty; the filter stays as a guard so such cells can never
@@ -298,12 +319,50 @@ if (n_unpriced > 0) {
                       format(n_unpriced, big.mark = ",")))
 }
 
-est <- dt[forested_base == TRUE & n_crops_priced > 0 &
-          !is.na(pressure_cell) & is.finite(pressure_cell) &
-          !is.na(ever_protected) & !is.na(area_km2) &
-          !is.na(centroid_lat) & !is.na(centroid_lon)]
+# ------------------------------------------------------------------------------
+# RISK SET: only designations that START after the price window closes.
+# ------------------------------------------------------------------------------
+# Prices are the 1991-2000 mean (PRICE_PRE_YEARS). A cell already protected by
+# 2000 was not at risk over the window those prices describe - its designation
+# was decided under earlier prices, and it cannot respond to the regressor. It
+# is neither a valid treated unit nor a valid control, so it is DROPPED rather
+# than recoded to zero, which would put already-protected land in the control
+# group and bias beta toward zero.
+#
+# Cells protected with an UNKNOWN desig_year are also dropped: they cannot be
+# placed on either side of the cutoff, and assuming they are post-2000 would
+# manufacture treatment.
+#
+# Surviving definition:
+#   ever_protected = 1  designated after DESIG_CUTOFF
+#   ever_protected = 0  never protected
+DESIG_CUTOFF <- max(PRICE_PRE_YEARS)
+
+dt[, prot_pre  := ever_protected == 1 & !is.na(desig_year) & desig_year <= DESIG_CUTOFF]
+dt[, prot_post := ever_protected == 1 & !is.na(desig_year) & desig_year >  DESIG_CUTOFF]
+dt[, prot_unk  := ever_protected == 1 & is.na(desig_year)]
+
+cand <- dt[forested_base == TRUE & n_crops_priced > 0 &
+           !is.na(pressure_cell) & is.finite(pressure_cell) &
+           !is.na(ever_protected) & !is.na(area_km2) &
+           !is.na(centroid_lat) & !is.na(centroid_lon) &
+           !is.na(forest_1990_pp) & !is.na(defor_9000_pp)]
 
 log_message("----------------------------------------")
+log_message(sprintf("Candidate cells before the %d cutoff: %s",
+                    DESIG_CUTOFF, format(nrow(cand), big.mark = ",")))
+log_message(sprintf("  protected on/before %d (dropped, not at risk): %s",
+                    DESIG_CUTOFF, format(cand[prot_pre == TRUE, .N], big.mark = ",")))
+log_message(sprintf("  protected, desig_year unknown (dropped):       %s",
+                    format(cand[prot_unk == TRUE, .N], big.mark = ",")))
+log_message(sprintf("  protected after %d (treated):                %s",
+                    DESIG_CUTOFF, format(cand[prot_post == TRUE, .N], big.mark = ",")))
+log_message(sprintf("  never protected (control):                    %s",
+                    format(cand[ever_protected == 0, .N], big.mark = ",")))
+
+est <- cand[prot_pre == FALSE & prot_unk == FALSE]
+est[, ever_protected := as.integer(prot_post)]
+
 log_message(sprintf("Estimation sample: %s cells (%.1f%% of %s)",
                     format(nrow(est), big.mark = ","),
                     100 * nrow(est) / nrow(dt),
@@ -353,36 +412,29 @@ cv <- function() vcov_conley(lat = ~centroid_lat, lon = ~centroid_lon,
 
 log_message("Estimating...")
 
-m1 <- feglm(ever_protected ~ pressure_cell_100, est,
-            family = binomial(), weights = ~area_km2, vcov = cv())
+# Stepwise. Each column adds one block; the dollar equivalents in the final
+# table column are the marginal rates of substitution from the most saturated
+# specification, m5.
+f1 <- ever_protected ~ pressure_cell_100
+f2 <- ever_protected ~ pressure_cell_100 | country_iso3
+f3 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
+        pop_density_1990 | country_iso3
+f4 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
+        pop_density_1990 + forest_1990_pp + defor_9000_pp | country_iso3
+f5 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
+        pop_density_1990 + forest_1990_pp + defor_9000_pp +
+        agc_2010 + biodiv_thr | country_iso3
 
-m2 <- feglm(ever_protected ~ pressure_cell_100 | country_iso3, est,
-            family = binomial(), weights = ~area_km2, vcov = cv())
+fit <- function(f) feglm(f, est, family = binomial(), weights = ~area_km2,
+                         vcov = cv())
+m1 <- fit(f1); m2 <- fit(f2); m3 <- fit(f3); m4 <- fit(f4); m5 <- fit(f5)
+mods <- list(m1, m2, m3, m4, m5)
 
-m3 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              elevation_m + pop_density_1990 | country_iso3, est,
-            family = binomial(), weights = ~area_km2, vcov = cv())
-
-m4 <- feglm(ever_protected ~ pressure_cell_100 + slope_degrees +
-              elevation_m + pop_density_1990 + agc_2010 + biodiv_thr |
-              country_iso3, est,
-            family = binomial(), weights = ~area_km2, vcov = cv())
-
-# terrain_ruggedness is NOT in the ladder. With slope_degrees it produced
-# +0.254 / -0.535 in job 1476554 - equal and opposing coefficients on two
-# near-identical terrain measures, which is a collinearity artifact rather than
-# two findings, and it would have corrupted both dollar valuations. slope stays
-# because degrees are interpretable.
-
-# Only m4 is tabulated. The ladder still matters for reading the attenuation,
-# so it goes to the log rather than into more files.
 log_message("Ladder, coefficient on agricultural profitability ($100/ha):")
-for (nm in c("(1) pooled", "(2) +country FE", "(3) +cost", "(4) +benefit")) {
-  mm <- list("(1) pooled" = m1, "(2) +country FE" = m2,
-             "(3) +cost" = m3, "(4) +benefit" = m4)[[nm]]
-  bb <- coef(mm)[["pressure_cell_100"]]
-  ss <- sqrt(vcov(mm)["pressure_cell_100", "pressure_cell_100"])
-  log_message(sprintf("  %-18s %8.4f  (SE %.4f, t %6.2f)", nm, bb, ss, bb / ss))
+for (i in seq_along(mods)) {
+  bb <- coef(mods[[i]])[["pressure_cell_100"]]
+  ss <- sqrt(vcov(mods[[i]])["pressure_cell_100", "pressure_cell_100"])
+  log_message(sprintf("  (%d) %8.4f  (SE %.4f, t %6.2f)", i, bb, ss, bb / ss))
 }
 
 # ==============================================================================
@@ -416,7 +468,7 @@ dollar_equiv <- function(model, price_var = "pressure_cell_100", scale = 100) {
   }))
 }
 
-de <- dollar_equiv(m4)
+de <- dollar_equiv(m5)
 
 # agc_2010 is above-ground biomass CARBON (tC/ha). tCO2 = tC * 44/12, so both
 # the coefficient and its dollar value are rescaled by 12/44 to read per tCO2 -
@@ -433,8 +485,8 @@ de[term == "agc_2010", `:=`(usd_per_unit = usd_per_unit / C_TO_CO2,
 # ------------------------------------------------------------------------------
 xbar_100 <- est[, weighted.mean(pressure_cell_100, area_km2)]
 pbar     <- est[, weighted.mean(ever_protected,    area_km2)]
-beta_p   <- coef(m4)[["pressure_cell_100"]]
-se_bp    <- sqrt(vcov(m4)["pressure_cell_100", "pressure_cell_100"])
+beta_p   <- coef(m5)[["pressure_cell_100"]]
+se_bp    <- sqrt(vcov(m5)["pressure_cell_100", "pressure_cell_100"])
 elast    <- beta_p * xbar_100 * (1 - pbar)
 elast_se <- abs(se_bp * xbar_100 * (1 - pbar))
 
@@ -459,54 +511,80 @@ LABEL <- c(
   slope_degrees     = "Slope (degrees)",
   elevation_m       = "Elevation (m)",
   pop_density_1990  = "Population density, 1990 (per km$^2$)",
+  forest_1990_pp    = "Forest cover, 1990 (pp)",
+  defor_9000_pp     = "Forest lost 1990--2000 (pp)",
   agc_2010          = "Above-ground carbon (tCO$_2$/ha)",
   biodiv_thr        = "Threatened species richness"
 )
 
-stars <- function(t) if (abs(t) > 2.576) "^{***}" else
+stars <- function(t) if (!is.finite(t)) "" else
+                     if (abs(t) > 2.576) "^{***}" else
                      if (abs(t) > 1.960) "^{**}"  else
                      if (abs(t) > 1.645) "^{*}"   else ""
 
-b4 <- coef(m4); v4 <- sqrt(diag(vcov(m4)))
-# report the carbon coefficient per tCO2 too, so (1) and (2) share a unit
-b_disp <- b4; s_disp <- v4
-b_disp["agc_2010"] <- b4[["agc_2010"]] / C_TO_CO2
-s_disp["agc_2010"] <- v4[["agc_2010"]] / C_TO_CO2
+# agc_2010 is reported per tCO2 in EVERY column, coefficient and dollar alike,
+# so the units never mix within a row. tCO2 = tC * 44/12.
+rescale <- function(k, v) if (k == "agc_2010") v / C_TO_CO2 else v
+
+cell <- function(m, k) {
+  b <- coef(m)
+  if (!k %in% names(b)) return(list("", ""))
+  se <- sqrt(vcov(m)[k, k])
+  list(sprintf("$%.4f%s$", rescale(k, b[[k]]), stars(b[[k]] / se)),
+       sprintf("$(%.4f)$", rescale(k, se)))
+}
+
+NCOL <- length(mods) + 1L   # coefficient columns + the dollar column
 
 tex <- file.path(output_dir, "protection_logit.tex")
 f <- file(tex, "w")
 cat("\\begin{table}[htbp]\n\\centering\n",
     "\\caption{\\label{tab:protection_logit} Protected-area siting and agricultural profitability.",
-    " Column (1) is an area-weighted logit of ever-protected status on forested-at-baseline cells,",
-    " with country fixed effects and Conley (50 km) standard errors.",
-    " Column (2) re-expresses each coefficient as $-\\gamma_k/\\beta_p$, the agricultural profit per",
-    " hectare the siting process behaves as if it will forgo for one more unit of the attribute;",
-    " delta-method standard errors.}\n",
-    "\\begin{tabular}{lcc}\n\\toprule\n",
-    " & (1) & (2) \\\\\n",
-    " & Coefficient & \\$/ha equivalent \\\\\n\\midrule\n", sep = "", file = f)
+    " Area-weighted logits of post-2000 designation on cells forested at baseline and not already",
+    " protected by ", DESIG_CUTOFF, "; Conley (50 km) standard errors in parentheses.",
+    " Column (", NCOL, ") re-expresses the column (", NCOL - 1L, ") coefficients as",
+    " $-\\gamma_k/\\beta_p$: the agricultural profit per hectare the siting process behaves as if",
+    " it will forgo for one more unit of the attribute, with delta-method standard errors.}\n",
+    "\\begin{tabular}{l", paste(rep("c", NCOL), collapse = ""), "}\n\\toprule\n",
+    sep = "", file = f)
+cat(" & ", paste(sprintf("(%d)", seq_len(NCOL)), collapse = " & "), " \\\\\n",
+    sprintf(" & \\multicolumn{%d}{c}{Coefficient} & \\$/ha equivalent \\\\\n",
+            length(mods)),
+    # coefficient columns occupy tabular columns 2..(1+k); the dollar column is
+    # tabular column 2+k, one further right than NCOL suggests because column 1
+    # is the row label.
+    sprintf("\\cmidrule(lr){2-%d}\\cmidrule(lr){%d-%d}\n",
+            length(mods) + 1L, length(mods) + 2L, length(mods) + 2L),
+    sep = "", file = f)
 
 for (k in names(LABEL)) {
-  if (!k %in% names(b_disp)) next
-  t_k <- b_disp[[k]] / s_disp[[k]]
-  col1 <- sprintf("$%.4f%s$", b_disp[[k]], stars(t_k))
-  col2 <- if (k == "pressure_cell_100") "---" else {
+  top <- character(0); bot <- character(0)
+  for (m in mods) { cc <- cell(m, k); top <- c(top, cc[[1]]); bot <- c(bot, cc[[2]]) }
+  if (all(top == "")) next
+  dcol <- if (k == "pressure_cell_100") "---" else {
     r <- de[term == k]
-    sprintf("$%.2f$", r$usd_per_unit)
+    if (nrow(r) == 0) "" else sprintf("$%.2f$", r$usd_per_unit)
   }
-  cat(sprintf("%s & %s & %s \\\\\n", LABEL[[k]], col1, col2), file = f)
-  se2 <- if (k == "pressure_cell_100") "" else
-           sprintf("(%.2f)", de[term == k, se])
-  cat(sprintf(" & (%.4f) & %s \\\\\n", s_disp[[k]], se2), file = f)
+  dse <- if (k == "pressure_cell_100" || nrow(de[term == k]) == 0) "" else
+           sprintf("$(%.2f)$", de[term == k, se])
+  cat(LABEL[[k]], " & ", paste(top, collapse = " & "), " & ", dcol, " \\\\\n",
+      " & ", paste(bot, collapse = " & "), " & ", dse, " \\\\\n", sep = "", file = f)
 }
 
+blank <- paste(rep("", length(mods)), collapse = " & ")
 cat("\\midrule\n",
-    "Country fixed effects & Yes & \\\\\n",
-    sprintf("Observations & %s & \\\\\n", format(m4$nobs, big.mark = ",")),
-    sprintf("Pseudo $R^2$ & %.4f & \\\\\n", fitstat(m4, "pr2")$pr2),
+    "Country fixed effects & ", paste(c("No", rep("Yes", length(mods) - 1L)),
+                                      collapse = " & "), " & \\\\\n",
+    "Observations & ", paste(sapply(mods, function(m) format(m$nobs, big.mark = ",")),
+                             collapse = " & "), " & \\\\\n",
+    "Pseudo $R^2$ & ", paste(sapply(mods, function(m) sprintf("%.4f", fitstat(m, "pr2")$pr2)),
+                             collapse = " & "), " & \\\\\n",
     "\\midrule\n",
-    sprintf("Elasticity of $\\Pr(\\text{protect})$ w.r.t. profit & $%.4f$ & \\\\\n", elast),
-    sprintf(" & (%.4f) & \\\\\n", elast_se),
+    "Elasticity of $\\Pr(\\text{protect})$ w.r.t. profit & ",
+    paste(rep("", length(mods) - 1L), collapse = " & "),
+    sprintf(" & $%.4f$ & \\\\\n", elast),
+    " & ", paste(rep("", length(mods) - 1L), collapse = " & "),
+    sprintf(" & $(%.4f)$ & \\\\\n", elast_se),
     "\\bottomrule\n\\end{tabular}\n\\end{table}\n", sep = "", file = f)
 close(f)
 log_message(sprintf("Wrote %s", tex))
@@ -538,3 +616,177 @@ ggsave(file.path(output_dir, "binscatter_pressure.png"), p,
        width = 6.5, height = 4.5, dpi = 300)
 log_message(sprintf("Wrote %s",
                     file.path(output_dir, "binscatter_pressure.png")))
+
+# ==============================================================================
+# 10. HETEROGENEITY IN THE PROFITABILITY SLOPE
+# ==============================================================================
+# Two cuts of the column (5) specification, both letting beta_p vary:
+#   by COUNTRY  - one slope per country, country FE still absorbing levels
+#   by COHORT   - one slope per designation-year block, estimated stacked
+#
+# Everything else in the specification is held at its column (5) form so the
+# heterogeneous slopes are comparable to the pooled number.
+
+MIN_CELLS_COUNTRY   <- 2000   # cells needed before a country gets its own slope
+MIN_TREATED_COUNTRY <- 100    # ... and treated cells, or the slope is noise
+MIN_TREATED_COHORT  <- 500
+
+RHS_CTRL <- c("slope_degrees", "elevation_m", "pop_density_1990",
+              "forest_1990_pp", "defor_9000_pp", "agc_2010", "biodiv_thr")
+
+# ------------------------------------------------------------------------------
+# 10a. COUNTRY-LEVEL SLOPES
+# ------------------------------------------------------------------------------
+# i(country_iso3, pressure_cell_100, ref = NULL) gives one slope per country;
+# the country FE still absorbs the level, so these are within-country slopes and
+# the pooled beta_p is their (precision-weighted) centre of mass.
+#
+# Countries are screened FIRST. A country with a handful of treated cells
+# produces a slope with no information but an eye-catching colour on a map, and
+# a reader cannot tell the two apart once it is filled in.
+
+ctry_n <- est[, .(n = .N, n_treated = sum(ever_protected),
+                  sd_press = sd(pressure_cell_100)), by = country_iso3]
+keep_ctry <- ctry_n[n >= MIN_CELLS_COUNTRY & n_treated >= MIN_TREATED_COUNTRY &
+                    n_treated < n & sd_press > 0, country_iso3]
+
+log_message(sprintf("Country slopes: %d of %d countries pass the screen (n>=%d, treated>=%d)",
+                    length(keep_ctry), nrow(ctry_n),
+                    MIN_CELLS_COUNTRY, MIN_TREATED_COUNTRY))
+
+est_c <- est[country_iso3 %chin% keep_ctry]
+
+# i(f, x) with a CONTINUOUS x returns a slope for every level - no reference
+# category is needed or wanted, because these are slopes rather than dummies and
+# the country FE already absorbs the levels. Do NOT add ref = NULL: fixest
+# 0.13.2 throws "node stack overflow" on it, which reads like a data problem but
+# is purely the argument.
+f_ctry <- as.formula(paste0(
+  "ever_protected ~ i(country_iso3, pressure_cell_100) + ",
+  paste(RHS_CTRL, collapse = " + "), " | country_iso3"))
+
+m_ctry <- feglm(f_ctry, est_c, family = binomial(), weights = ~area_km2,
+                vcov = cv())
+
+cb <- coef(m_ctry); cs <- sqrt(diag(vcov(m_ctry)))
+sel <- grep("^country_iso3::", names(cb))
+# Names come back as "country_iso3::BRA:pressure_cell_100". Stripped with two
+# plain substitutions rather than a backreference - shorter, and it cannot be
+# silently mangled by escaping.
+ctry_lab <- sub("^country_iso3::", "", names(cb)[sel])
+ctry_lab <- sub(":pressure_cell_100$", "", ctry_lab)
+
+beta_ctry <- data.table(country_iso3 = ctry_lab,
+                        beta = as.numeric(cb[sel]), se = as.numeric(cs[sel]))
+stopifnot(!any(grepl("[:]", beta_ctry$country_iso3)))
+beta_ctry <- merge(beta_ctry, ctry_n, by = "country_iso3")
+beta_ctry[, t := beta / se]
+
+log_message(sprintf("  slopes estimated for %d countries; %d negative, %d significant at 5%%",
+                    nrow(beta_ctry), beta_ctry[beta < 0, .N],
+                    beta_ctry[abs(t) > 1.96, .N]))
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+wmap  <- merge(world, beta_ctry, by.x = "iso_a3", by.y = "country_iso3",
+               all.x = TRUE)
+
+# Diverging scale centred on zero, symmetric so colour intensity is comparable
+# either side. Winsorized at the 5th/95th percentile of the estimated slopes so
+# one imprecise country does not flatten the rest of the map to a single hue.
+lim <- as.numeric(quantile(abs(beta_ctry$beta), 0.95, na.rm = TRUE))
+
+p_map <- ggplot(wmap) +
+  geom_sf(aes(fill = pmax(pmin(beta, lim), -lim)), colour = "gray70",
+          linewidth = 0.1) +
+  scale_fill_gradient2(low = "#08306b", mid = "white", high = "#67000d",
+                       midpoint = 0, limits = c(-lim, lim), na.value = "gray92",
+                       name = expression(beta[p])) +
+  coord_sf(ylim = c(-35, 35), expand = FALSE) +
+  theme_void() +
+  theme(legend.position = "right")
+
+# 360 degrees of longitude against 70 of latitude is a ~5:1 frame; anything
+# taller letterboxes the map inside a half-empty canvas.
+ggsave(file.path(output_dir, "beta_by_country_map.png"), p_map,
+       width = 11, height = 3.2, dpi = 300, bg = "white")
+log_message(sprintf("Wrote %s", file.path(output_dir, "beta_by_country_map.png")))
+
+# ------------------------------------------------------------------------------
+# 10b. COHORT-LEVEL SLOPES
+# ------------------------------------------------------------------------------
+# Cohort is defined only for TREATED cells - a never-protected cell has no
+# designation year - so this cannot be a single interacted regression. Each
+# cohort is estimated on its own stack: {cells designated in that cohort} plus
+# the FULL never-protected control pool.
+#
+# The control pool is therefore REUSED across cohorts. That is standard for a
+# stacked design and leaves each beta unbiased, but the cohort estimates are not
+# independent of one another, so the plotted intervals should not be read as if
+# a difference between two cohorts were a two-sample test.
+
+est[, cohort := cut(desig_year,
+                    breaks = c(DESIG_CUTOFF, 2005, 2010, 2015, Inf),
+                    labels = c("2001-2005", "2006-2010", "2011-2015", "2016+"),
+                    right = TRUE)]
+
+controls_pool <- est[ever_protected == 0]
+coh_levels <- levels(est$cohort)
+coh_n <- est[ever_protected == 1, .N, by = cohort][order(cohort)]
+log_message("Treated cells by cohort:")
+for (i in seq_len(nrow(coh_n))) {
+  log_message(sprintf("  %-10s %s", as.character(coh_n$cohort[i]),
+                      format(coh_n$N[i], big.mark = ",")))
+}
+
+f_coh <- as.formula(paste0("ever_protected ~ pressure_cell_100 + ",
+                           paste(RHS_CTRL, collapse = " + "), " | country_iso3"))
+
+beta_coh <- rbindlist(lapply(coh_levels, function(cl) {
+  n_tr <- est[ever_protected == 1 & cohort == cl, .N]
+  if (is.na(n_tr) || n_tr < MIN_TREATED_COHORT) {
+    log_message(sprintf("  skipping cohort %s: only %s treated cells",
+                        cl, format(n_tr, big.mark = ",")))
+    return(NULL)
+  }
+  stack <- rbind(est[ever_protected == 1 & cohort == cl], controls_pool)
+  mm <- feglm(f_coh, stack, family = binomial(), weights = ~area_km2,
+              vcov = cv())
+  data.table(cohort = cl,
+             beta = coef(mm)[["pressure_cell_100"]],
+             se = sqrt(vcov(mm)["pressure_cell_100", "pressure_cell_100"]),
+             n_treated = n_tr)
+}))
+
+if (nrow(beta_coh) > 0) {
+  beta_coh[, `:=`(lo = beta - 1.96 * se, hi = beta + 1.96 * se)]
+  beta_coh[, cohort := factor(cohort, levels = coh_levels)]
+
+  log_message("Cohort slopes on agricultural profitability:")
+  for (i in seq_len(nrow(beta_coh))) {
+    log_message(sprintf("  %-10s %8.4f  [%7.4f, %7.4f]  n_treated %s",
+                        as.character(beta_coh$cohort[i]), beta_coh$beta[i],
+                        beta_coh$lo[i], beta_coh$hi[i],
+                        format(beta_coh$n_treated[i], big.mark = ",")))
+  }
+
+  # Intervals are the point of a coefficient plot, so they stay - unlike the
+  # binscatter, where they were decoration.
+  p_coh <- ggplot(beta_coh, aes(x = cohort, y = beta)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "gray50") +
+    geom_hline(yintercept = coef(m5)[["pressure_cell_100"]],
+               linetype = "dashed", linewidth = 0.3, colour = "gray50") +
+    geom_linerange(aes(ymin = lo, ymax = hi), colour = "steelblue",
+                   linewidth = 0.6) +
+    geom_point(colour = "steelblue", size = 2.4) +
+    labs(x = "Designation cohort",
+         y = "Coefficient on agricultural profitability") +
+    theme_classic(base_size = 12) +
+    theme(panel.grid = element_blank())
+
+  ggsave(file.path(output_dir, "beta_by_cohort.png"), p_coh,
+         width = 6.5, height = 4.5, dpi = 300, bg = "white")
+  log_message(sprintf("Wrote %s", file.path(output_dir, "beta_by_cohort.png")))
+}
+
+log_message(sprintf("Completed in %.1f minutes",
+                    as.numeric(difftime(Sys.time(), start_time, units = "mins"))))

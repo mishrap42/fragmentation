@@ -218,6 +218,15 @@ GRID_SCHEMA <- c(
 # ==============================================================================
 
 # Years of TMF data availability
+# Crop-price window. FAO prices are averaged over these years and held fixed,
+# so this is also the risk-set cutoff for anything that treats price as
+# pre-determined: 6_protection_logit.R sets DESIG_CUTOFF <- max(PRICE_PRE_YEARS).
+# Defined HERE rather than in 0e_prepare_crop_prices.R because both the build
+# and the analysis side need it, and both source this file - 6_protection_logit.R
+# does not source 0e, so referencing it there failed with
+# "object 'PRICE_PRE_YEARS' not found" after ~90s of setup work.
+PRICE_PRE_YEARS <- 1991:2000
+
 TMF_YEARS <- 1990:2023   # JRC TMF v1 AnnualChange: 34 rasters per tile
 N_TMF_YEARS <- length(TMF_YEARS)
 

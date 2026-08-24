@@ -39,7 +39,7 @@ suppressPackageStartupMessages(library(countrycode))
 start_time <- Sys.time()
 log_job_start("0e_prepare_crop_prices.R", task_id = 1)
 
-PRICE_PRE_YEARS <- 1991:2000
+# PRICE_PRE_YEARS comes from BUILD_workspace.R (shared with the analysis side).
 
 stopifnot(file.exists(fao_prices_path),
           file.exists(trucking_cost_path),

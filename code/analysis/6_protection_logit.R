@@ -407,187 +407,246 @@ for (v in c("pressure_cell", "pressure_crop", "pressure_max")) {
 # elevation enters raw for the same reason. The earlier asinh() guarded against
 # NaN from below-sea-level cells under log(x+1); linear needs no guard.
 
+# ------------------------------------------------------------------------------
+# BIOME, for the country x biome fixed-effect variant.
+#
+# Read from the lookup 1_stacked_did.R already built and cached; nothing new is
+# computed here. If the cache is absent that variant is skipped rather than
+# built, since constructing it is a separate decision.
+#
+# ADM-2 is NOT available: the grid was cut on GADM ADM_0 only, so the panel
+# carries no sub-national identifier. That variant needs a centroid join to
+# GADM ADM_2 (47,217 polygons) which has not been made.
+# ------------------------------------------------------------------------------
+
+biome_cache <- file.path(project_root, "Data/build/final/grid_biome.parquet")
+if (file.exists(biome_cache)) {
+  est <- merge(est, as.data.table(arrow::read_parquet(biome_cache)),
+               by = "grid_id", all.x = TRUE)
+  log_message(sprintf("Biome attached from cache: %d biomes, %s cells unassigned",
+                      uniqueN(est$biome, na.rm = TRUE),
+                      format(sum(is.na(est$biome)), big.mark = ",")))
+} else {
+  log_message("Biome cache absent; the country x biome variant will be skipped.")
+}
+
 cv <- function() vcov_conley(lat = ~centroid_lat, lon = ~centroid_lon,
                              cutoff = CONLEY_KM)
 
 log_message("Estimating...")
 
-# Stepwise. Each column adds one block; the dollar equivalents in the final
-# table column are the marginal rates of substitution from the most saturated
-# specification, m5.
-f1 <- ever_protected ~ pressure_cell_100
-f2 <- ever_protected ~ pressure_cell_100 | country_iso3
-f3 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
-        pop_density_1990 | country_iso3
-f4 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
-        pop_density_1990 + forest_1990_pp + defor_9000_pp | country_iso3
-f5 <- ever_protected ~ pressure_cell_100 + slope_degrees + elevation_m +
-        pop_density_1990 + forest_1990_pp + defor_9000_pp +
-        agc_2010 + biodiv_thr | country_iso3
+# Columns (4) and (5) are ALTERNATIVES, not a nesting. Forest state and carbon
+# are close to collinear - above-ground carbon is essentially forest extent
+# priced in tCO2 - so entering both put two measures of the same thing on the
+# right-hand side, and forest_1990_pp went from 0.0277*** to 0.0036 n.s. between
+# them. Splitting the blocks lets each be read on its own:
+#   (4) forest block   forest_1990_pp + defor_9000_pp
+#   (5) carbon block   agc_2010 + biodiv_thr
+# Both sit on top of (3), so they are directly comparable to each other and to
+# the geography-only column.
+BLOCK_GEO    <- c("slope_degrees", "elevation_m", "pop_density_1990")
+BLOCK_FOREST <- c("forest_1990_pp", "defor_9000_pp")
+BLOCK_CARBON <- c("agc_2010", "biodiv_thr")
+
+mk_f <- function(rhs, fe) {
+  rhs_txt <- paste(c("pressure_cell_100", rhs), collapse = " + ")
+  as.formula(if (is.null(fe)) paste("ever_protected ~", rhs_txt)
+             else paste("ever_protected ~", rhs_txt, "|", fe))
+}
 
 fit <- function(f) feglm(f, est, family = binomial(), weights = ~area_km2,
                          vcov = cv())
-m1 <- fit(f1); m2 <- fit(f2); m3 <- fit(f3); m4 <- fit(f4); m5 <- fit(f5)
-mods <- list(m1, m2, m3, m4, m5)
 
-log_message("Ladder, coefficient on agricultural profitability ($100/ha):")
-for (i in seq_along(mods)) {
-  bb <- coef(mods[[i]])[["pressure_cell_100"]]
-  ss <- sqrt(vcov(mods[[i]])["pressure_cell_100", "pressure_cell_100"])
-  log_message(sprintf("  (%d) %8.4f  (SE %.4f, t %6.2f)", i, bb, ss, bb / ss))
-}
-
-# ==============================================================================
-# 7. DOLLAR-EQUIVALENT VALUATIONS (marginal rate of substitution)
-# ==============================================================================
-# In  Pr(protect) = Lambda(alpha + beta_p * pressure + sum_k gamma_k x_k),
-# holding the index fixed:
-#
-#     beta_p * d(pressure) + gamma_k * dx_k = 0
-#     =>  d(pressure)/dx_k = -gamma_k / beta_p
-#
-# pressure is scaled in $100/ha, so multiplying by 100 gives USD/ha per unit of
-# x_k: the agricultural profit the siting process behaved as if it was willing
-# to forgo for one more unit of x_k. Revealed preference, not social value, and
-# only as credible as beta_p.
-#
-# Delta method on r = -gamma/beta:
-#   dr/dgamma = -1/beta ,  dr/dbeta = gamma/beta^2
-# The ratio blows up as beta_p -> 0, so beta_p's t is reported in the table.
-
-dollar_equiv <- function(model, price_var = "pressure_cell_100", scale = 100) {
-  b  <- coef(model); V <- vcov(model)
-  bp <- b[[price_var]]; vp <- V[price_var, price_var]
-
-  rbindlist(lapply(setdiff(names(b), price_var), function(k) {
-    g <- b[[k]]; vg <- V[k, k]; cg <- V[k, price_var]
-    dg <- -1 / bp * scale
-    db <-  g / bp^2 * scale
-    data.table(term = k, usd_per_unit = -g / bp * scale,
-               se = sqrt(max(dg^2 * vg + db^2 * vp + 2 * dg * db * cg, 0)))
-  }))
-}
-
-de <- dollar_equiv(m5)
-
-# agc_2010 is above-ground biomass CARBON (tC/ha). tCO2 = tC * 44/12, so both
-# the coefficient and its dollar value are rescaled by 12/44 to read per tCO2 -
-# same convention as 5_protection_lpm.R's committed-carbon calculation.
-C_TO_CO2 <- 44 / 12
-de[term == "agc_2010", `:=`(usd_per_unit = usd_per_unit / C_TO_CO2,
-                            se           = se / C_TO_CO2)]
-
-# ------------------------------------------------------------------------------
-# Logit elasticity of the protection probability w.r.t. agricultural profit.
-#   p = Lambda(eta),  d p / d x = beta * p (1-p)
-#   elasticity = (d p / d x) * (x / p) = beta * x * (1 - p)
-# Evaluated at the area-weighted sample means, matching the estimation weights.
-# ------------------------------------------------------------------------------
-xbar_100 <- est[, weighted.mean(pressure_cell_100, area_km2)]
-pbar     <- est[, weighted.mean(ever_protected,    area_km2)]
-beta_p   <- coef(m5)[["pressure_cell_100"]]
-se_bp    <- sqrt(vcov(m5)["pressure_cell_100", "pressure_cell_100"])
-elast    <- beta_p * xbar_100 * (1 - pbar)
-elast_se <- abs(se_bp * xbar_100 * (1 - pbar))
-
-log_message("----------------------------------------")
-log_message(sprintf("beta_p = %.4f (t = %.2f)", beta_p, beta_p / se_bp))
-log_message(sprintf("elasticity of P(protect) wrt ag profit = %.4f (SE %.4f)",
-                    elast, elast_se))
-for (i in seq_len(nrow(de))) {
-  log_message(sprintf("  %-18s %10.2f  (SE %8.2f)  USD/ha",
-                      de$term[i], de$usd_per_unit[i], de$se[i]))
-}
-
-# ==============================================================================
-# 8. TABLE
-# ==============================================================================
-# ONE table. Column (1) is the fitted logit in raw units; column (2) is the same
-# row re-expressed as dollars per hectare of forgone agricultural profit. The
-# price variable is the numeraire, so it has no entry in (2).
-
-LABEL <- c(
-  pressure_cell_100 = "Agricultural profitability (\\$100/ha)",
-  slope_degrees     = "Slope (degrees)",
-  elevation_m       = "Elevation (m)",
-  pop_density_1990  = "Population density, 1990 (per km$^2$)",
-  forest_1990_pp    = "Forest cover, 1990 (pp)",
-  defor_9000_pp     = "Forest lost 1990--2000 (pp)",
-  agc_2010          = "Above-ground carbon (tCO$_2$/ha)",
-  biodiv_thr        = "Threatened species richness"
+# Fixed-effect variants. Each writes its own table; nothing is chosen here.
+#   country        country_iso3          the original
+#   (ADM-2 omitted: no sub-national identifier exists in the panel)
+#   country_biome  country_iso3 ^ biome  matches the stacked DiD stratum
+FE_SPECS <- list(
+  list(key = "countryFE",      fe = "country_iso3",           label = "Country"),
+  list(key = "country_biomeFE", fe = "country_iso3^biome",    label = "Country $\\times$ biome")
 )
 
-stars <- function(t) if (!is.finite(t)) "" else
-                     if (abs(t) > 2.576) "^{***}" else
-                     if (abs(t) > 1.960) "^{**}"  else
-                     if (abs(t) > 1.645) "^{*}"   else ""
+run_fe_spec <- function(FE_KEY, FE_FE, FE_LABEL) {
+  log_message(sprintf("--- fixed effects: %s ---", FE_LABEL))
+  m1 <- fit(mk_f(character(0), NULL))
+  m2 <- fit(mk_f(character(0), FE_FE))
+  m3 <- fit(mk_f(BLOCK_GEO, FE_FE))
+  m4 <- fit(mk_f(c(BLOCK_GEO, BLOCK_FOREST), FE_FE))
+  m5 <- fit(mk_f(c(BLOCK_GEO, BLOCK_CARBON), FE_FE))
+  mods <- list(m1, m2, m3, m4, m5)
 
-# agc_2010 is reported per tCO2 in EVERY column, coefficient and dollar alike,
-# so the units never mix within a row. tCO2 = tC * 44/12.
-rescale <- function(k, v) if (k == "agc_2010") v / C_TO_CO2 else v
-
-cell <- function(m, k) {
-  b <- coef(m)
-  if (!k %in% names(b)) return(list("", ""))
-  se <- sqrt(vcov(m)[k, k])
-  list(sprintf("$%.4f%s$", rescale(k, b[[k]]), stars(b[[k]] / se)),
-       sprintf("$(%.4f)$", rescale(k, se)))
-}
-
-NCOL <- length(mods) + 1L   # coefficient columns + the dollar column
-
-tex <- file.path(output_dir, "protection_logit.tex")
-f <- file(tex, "w")
-cat("\\begin{table}[htbp]\n\\centering\n",
-    "\\caption{\\label{tab:protection_logit} Protected-area siting and agricultural profitability.",
-    " Area-weighted logits of post-2000 designation on cells forested at baseline and not already",
-    " protected by ", DESIG_CUTOFF, "; Conley (50 km) standard errors in parentheses.",
-    " Column (", NCOL, ") re-expresses the column (", NCOL - 1L, ") coefficients as",
-    " $-\\gamma_k/\\beta_p$: the agricultural profit per hectare the siting process behaves as if",
-    " it will forgo for one more unit of the attribute, with delta-method standard errors.}\n",
-    "\\begin{tabular}{l", paste(rep("c", NCOL), collapse = ""), "}\n\\toprule\n",
-    sep = "", file = f)
-cat(" & ", paste(sprintf("(%d)", seq_len(NCOL)), collapse = " & "), " \\\\\n",
-    sprintf(" & \\multicolumn{%d}{c}{Coefficient} & \\$/ha equivalent \\\\\n",
-            length(mods)),
-    # coefficient columns occupy tabular columns 2..(1+k); the dollar column is
-    # tabular column 2+k, one further right than NCOL suggests because column 1
-    # is the row label.
-    sprintf("\\cmidrule(lr){2-%d}\\cmidrule(lr){%d-%d}\n",
-            length(mods) + 1L, length(mods) + 2L, length(mods) + 2L),
-    sep = "", file = f)
-
-for (k in names(LABEL)) {
-  top <- character(0); bot <- character(0)
-  for (m in mods) { cc <- cell(m, k); top <- c(top, cc[[1]]); bot <- c(bot, cc[[2]]) }
-  if (all(top == "")) next
-  dcol <- if (k == "pressure_cell_100") "---" else {
-    r <- de[term == k]
-    if (nrow(r) == 0) "" else sprintf("$%.2f$", r$usd_per_unit)
+  log_message("Ladder, coefficient on agricultural profitability ($100/ha):")
+  for (i in seq_along(mods)) {
+    bb <- coef(mods[[i]])[["pressure_cell_100"]]
+    ss <- sqrt(vcov(mods[[i]])["pressure_cell_100", "pressure_cell_100"])
+    log_message(sprintf("  (%d) %8.4f  (SE %.4f, t %6.2f)", i, bb, ss, bb / ss))
   }
-  dse <- if (k == "pressure_cell_100" || nrow(de[term == k]) == 0) "" else
-           sprintf("$(%.2f)$", de[term == k, se])
-  cat(LABEL[[k]], " & ", paste(top, collapse = " & "), " & ", dcol, " \\\\\n",
-      " & ", paste(bot, collapse = " & "), " & ", dse, " \\\\\n", sep = "", file = f)
+
+  # ==============================================================================
+  # 7. DOLLAR-EQUIVALENT VALUATIONS (marginal rate of substitution)
+  # ==============================================================================
+  # In  Pr(protect) = Lambda(alpha + beta_p * pressure + sum_k gamma_k x_k),
+  # holding the index fixed:
+  #
+  #     beta_p * d(pressure) + gamma_k * dx_k = 0
+  #     =>  d(pressure)/dx_k = -gamma_k / beta_p
+  #
+  # pressure is scaled in $100/ha, so multiplying by 100 gives USD/ha per unit of
+  # x_k: the agricultural profit the siting process behaved as if it was willing
+  # to forgo for one more unit of x_k. Revealed preference, not social value, and
+  # only as credible as beta_p.
+  #
+  # Delta method on r = -gamma/beta:
+  #   dr/dgamma = -1/beta ,  dr/dbeta = gamma/beta^2
+  # The ratio blows up as beta_p -> 0, so beta_p's t is reported in the table.
+
+  dollar_equiv <- function(model, price_var = "pressure_cell_100", scale = 100) {
+    b  <- coef(model); V <- vcov(model)
+    bp <- b[[price_var]]; vp <- V[price_var, price_var]
+
+    rbindlist(lapply(setdiff(names(b), price_var), function(k) {
+      g <- b[[k]]; vg <- V[k, k]; cg <- V[k, price_var]
+      dg <- -1 / bp * scale
+      db <-  g / bp^2 * scale
+      data.table(term = k, usd_per_unit = -g / bp * scale,
+                 se = sqrt(max(dg^2 * vg + db^2 * vp + 2 * dg * db * cg, 0)))
+    }))
+  }
+
+  de <- dollar_equiv(m5)
+
+  # agc_2010 is above-ground biomass CARBON (tC/ha). tCO2 = tC * 44/12, so both
+  # the coefficient and its dollar value are rescaled by 12/44 to read per tCO2 -
+  # same convention as 5_protection_lpm.R's committed-carbon calculation.
+  C_TO_CO2 <- 44 / 12
+  de[term == "agc_2010", `:=`(usd_per_unit = usd_per_unit / C_TO_CO2,
+                              se           = se / C_TO_CO2)]
+
+  # ------------------------------------------------------------------------------
+  # Logit elasticity of the protection probability w.r.t. agricultural profit.
+  #   p = Lambda(eta),  d p / d x = beta * p (1-p)
+  #   elasticity = (d p / d x) * (x / p) = beta * x * (1 - p)
+  # Evaluated at the area-weighted sample means, matching the estimation weights.
+  # ------------------------------------------------------------------------------
+  xbar_100 <- est[, weighted.mean(pressure_cell_100, area_km2)]
+  pbar     <- est[, weighted.mean(ever_protected,    area_km2)]
+  beta_p   <- coef(m5)[["pressure_cell_100"]]
+  se_bp    <- sqrt(vcov(m5)["pressure_cell_100", "pressure_cell_100"])
+  elast    <- beta_p * xbar_100 * (1 - pbar)
+  elast_se <- abs(se_bp * xbar_100 * (1 - pbar))
+
+  log_message("----------------------------------------")
+  log_message(sprintf("beta_p = %.4f (t = %.2f)", beta_p, beta_p / se_bp))
+  log_message(sprintf("elasticity of P(protect) wrt ag profit = %.4f (SE %.4f)",
+                      elast, elast_se))
+  for (i in seq_len(nrow(de))) {
+    log_message(sprintf("  %-18s %10.2f  (SE %8.2f)  USD/ha",
+                        de$term[i], de$usd_per_unit[i], de$se[i]))
+  }
+
+  # ==============================================================================
+  # 8. TABLE
+  # ==============================================================================
+  # ONE table. Column (1) is the fitted logit in raw units; column (2) is the same
+  # row re-expressed as dollars per hectare of forgone agricultural profit. The
+  # price variable is the numeraire, so it has no entry in (2).
+
+  LABEL <- c(
+    pressure_cell_100 = "Agricultural profitability (\\$100/ha)",
+    slope_degrees     = "Slope (degrees)",
+    elevation_m       = "Elevation (m)",
+    pop_density_1990  = "Population density, 1990 (per km$^2$)",
+    forest_1990_pp    = "Forest cover, 1990 (pp)",
+    defor_9000_pp     = "Forest lost 1990--2000 (pp)",
+    agc_2010          = "Above-ground carbon (tCO$_2$/ha)",
+    biodiv_thr        = "Threatened species richness"
+  )
+
+  stars <- function(t) if (!is.finite(t)) "" else
+                       if (abs(t) > 2.576) "^{***}" else
+                       if (abs(t) > 1.960) "^{**}"  else
+                       if (abs(t) > 1.645) "^{*}"   else ""
+
+  # agc_2010 is reported per tCO2 in EVERY column, coefficient and dollar alike,
+  # so the units never mix within a row. tCO2 = tC * 44/12.
+  rescale <- function(k, v) if (k == "agc_2010") v / C_TO_CO2 else v
+
+  cell <- function(m, k) {
+    b <- coef(m)
+    if (!k %in% names(b)) return(list("", ""))
+    se <- sqrt(vcov(m)[k, k])
+    list(sprintf("$%.4f%s$", rescale(k, b[[k]]), stars(b[[k]] / se)),
+         sprintf("$(%.4f)$", rescale(k, se)))
+  }
+
+  NCOL <- length(mods) + 1L   # coefficient columns + the dollar column
+
+  tex <- file.path(output_dir, sprintf("protection_logit_%s.tex", FE_KEY))
+  f <- file(tex, "w")
+  cat("\\begin{table}[htbp]\n\\centering\n",
+      "\\caption{\\label{tab:protection_logit_", FE_KEY, "} Protected-area siting and agricultural profitability.",
+      " Area-weighted logits of post-2000 designation on cells forested at baseline and not already",
+      " protected by ", DESIG_CUTOFF, "; Conley (50 km) standard errors in parentheses.",
+      " Column (", NCOL, ") re-expresses the column (", NCOL - 1L, ") coefficients as",
+      " $-\\gamma_k/\\beta_p$: the agricultural profit per hectare the siting process behaves as if",
+      " it will forgo for one more unit of the attribute, with delta-method standard errors.}\n",
+      "\\begin{tabular}{l", paste(rep("c", NCOL), collapse = ""), "}\n\\toprule\n",
+      sep = "", file = f)
+  cat(" & ", paste(sprintf("(%d)", seq_len(NCOL)), collapse = " & "), " \\\\\n",
+      sprintf(" & \\multicolumn{%d}{c}{Coefficient} & \\$/ha equivalent \\\\\n",
+              length(mods)),
+      # coefficient columns occupy tabular columns 2..(1+k); the dollar column is
+      # tabular column 2+k, one further right than NCOL suggests because column 1
+      # is the row label.
+      sprintf("\\cmidrule(lr){2-%d}\\cmidrule(lr){%d-%d}\n",
+              length(mods) + 1L, length(mods) + 2L, length(mods) + 2L),
+      sep = "", file = f)
+
+  for (k in names(LABEL)) {
+    top <- character(0); bot <- character(0)
+    for (m in mods) { cc <- cell(m, k); top <- c(top, cc[[1]]); bot <- c(bot, cc[[2]]) }
+    if (all(top == "")) next
+    dcol <- if (k == "pressure_cell_100") "---" else {
+      r <- de[term == k]
+      if (nrow(r) == 0) "" else sprintf("$%.2f$", r$usd_per_unit)
+    }
+    dse <- if (k == "pressure_cell_100" || nrow(de[term == k]) == 0) "" else
+             sprintf("$(%.2f)$", de[term == k, se])
+    cat(LABEL[[k]], " & ", paste(top, collapse = " & "), " & ", dcol, " \\\\\n",
+        " & ", paste(bot, collapse = " & "), " & ", dse, " \\\\\n", sep = "", file = f)
+  }
+
+  blank <- paste(rep("", length(mods)), collapse = " & ")
+  cat("\\midrule\n",
+      FE_LABEL, " fixed effects & ", paste(c("No", rep("Yes", length(mods) - 1L)),
+                                        collapse = " & "), " & \\\\\n",
+      "Observations & ", paste(sapply(mods, function(m) format(m$nobs, big.mark = ",")),
+                               collapse = " & "), " & \\\\\n",
+      "Pseudo $R^2$ & ", paste(sapply(mods, function(m) sprintf("%.4f", fitstat(m, "pr2")$pr2)),
+                               collapse = " & "), " & \\\\\n",
+      "\\midrule\n",
+      "Elasticity of $\\Pr(\\text{protect})$ w.r.t. profit & ",
+      paste(rep("", length(mods) - 1L), collapse = " & "),
+      sprintf(" & $%.4f$ & \\\\\n", elast),
+      " & ", paste(rep("", length(mods) - 1L), collapse = " & "),
+      sprintf(" & $(%.4f)$ & \\\\\n", elast_se),
+      "\\bottomrule\n\\end{tabular}\n\\end{table}\n", sep = "", file = f)
+  close(f)
+  log_message(sprintf("Wrote %s", tex))
+
+  invisible(list(m5 = m5, mods = mods))
 }
 
-blank <- paste(rep("", length(mods)), collapse = " & ")
-cat("\\midrule\n",
-    "Country fixed effects & ", paste(c("No", rep("Yes", length(mods) - 1L)),
-                                      collapse = " & "), " & \\\\\n",
-    "Observations & ", paste(sapply(mods, function(m) format(m$nobs, big.mark = ",")),
-                             collapse = " & "), " & \\\\\n",
-    "Pseudo $R^2$ & ", paste(sapply(mods, function(m) sprintf("%.4f", fitstat(m, "pr2")$pr2)),
-                             collapse = " & "), " & \\\\\n",
-    "\\midrule\n",
-    "Elasticity of $\\Pr(\\text{protect})$ w.r.t. profit & ",
-    paste(rep("", length(mods) - 1L), collapse = " & "),
-    sprintf(" & $%.4f$ & \\\\\n", elast),
-    " & ", paste(rep("", length(mods) - 1L), collapse = " & "),
-    sprintf(" & $(%.4f)$ & \\\\\n", elast_se),
-    "\\bottomrule\n\\end{tabular}\n\\end{table}\n", sep = "", file = f)
-close(f)
-log_message(sprintf("Wrote %s", tex))
+results <- list()
+for (s in FE_SPECS) {
+  results[[s$key]] <- tryCatch(run_fe_spec(s$key, s$fe, s$label),
+    error = function(e) { log_message(sprintf("  FAILED (%s): %s", s$key, conditionMessage(e))); NULL })
+}
+
+# Downstream figures use the country-FE fit, the original specification.
+stopifnot(!is.null(results$countryFE))
+m5   <- results$countryFE$m5
+mods <- results$countryFE$mods
 
 # ==============================================================================
 # 9. BINSCATTER

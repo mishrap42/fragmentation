@@ -132,8 +132,32 @@ xw <- xw[cropshare_col %in% avail & yield_col %in% avail]
 log_message(sprintf("Crops with both layers present: %d", nrow(xw)))
 stopifnot(nrow(xw) > 0)
 
+# GAEZ potential-yield columns for the same crops. gaez is pipe-separated where
+# GAEZ ships no aggregate layer (rice = ricd|ricw); 1b has already materialised
+# the composite as gaez_<earthstat-name>200a/b, so the column to ask for is
+# always keyed on the EarthStat crop name, never on the raw GAEZ codes.
+xw[, gaez_a := fifelse(nzchar(gaez), paste0("gaez_", earthstat, "200a"), NA_character_)]
+xw[, gaez_b := fifelse(nzchar(gaez), paste0("gaez_", earthstat, "200b"), NA_character_)]
+# ... except for single-code crops, where 1b builds no composite and the column
+# carries the GAEZ code itself.
+xw[nzchar(gaez) & !grepl("|", gaez, fixed = TRUE),
+   `:=`(gaez_a = paste0("gaez_", gaez, "200a"),
+        gaez_b = paste0("gaez_", gaez, "200b"))]
+
+HAS_GAEZ <- any(grepl("^gaez_", avail))
+if (HAS_GAEZ) {
+  xw[, `:=`(gaez_a = fifelse(gaez_a %in% avail, gaez_a, NA_character_),
+            gaez_b = fifelse(gaez_b %in% avail, gaez_b, NA_character_))]
+  log_message(sprintf("GAEZ layers usable: %d crops (200a), %d crops (200b)",
+                      sum(!is.na(xw$gaez_a)), sum(!is.na(xw$gaez_b))))
+} else {
+  log_message("No gaez_* columns in the cross-section; IV section will be skipped.")
+  xw[, `:=`(gaez_a = NA_character_, gaez_b = NA_character_)]
+}
+
 need <- intersect(c("grid_id", "cropland_frac", "pasture_frac",
-                    "cropshare_total", xw$cropshare_col, xw$yield_col), avail)
+                    "cropshare_total", xw$cropshare_col, xw$yield_col,
+                    na.omit(xw$gaez_a), na.omit(xw$gaez_b)), avail)
 
 cs <- setDT(arrow::read_parquet(cropland_final_file,
                                 col_select = arrow::all_of(need)))
@@ -277,6 +301,85 @@ if (length(unpriced_crops) > 0) {
 dt[, `:=`(pressure_cell  = press_cell,
           pressure_max   = press_max,
           n_crops_priced = n_priced)]
+
+# ------------------------------------------------------------------------------
+# POTENTIAL profit, the instrument. Same prices, same transport wedge, GAEZ
+# potential yield in place of EarthStat realised yield.
+# ------------------------------------------------------------------------------
+#   pi_pot_cr = (p_c - tau_r) * y^GAEZ_cr / 1000       GAEZ is kg/ha, prices $/t
+#
+# TWO weightings, because the choice is not innocuous:
+#
+#   pressure_pot_cell  sum_c cropshare_cr * pi_pot_cr
+#       The literal "only the yield leg is instrumented" object. But it inherits
+#       the EarthStat weights, so it is ZERO wherever nothing is grown - the same
+#       42.9% of the sample where the endogenous regressor is zero. It therefore
+#       has no first-stage power in exactly the forest interior the design is
+#       about. Built for comparison, not as the headline.
+#
+#   pressure_pot_max   max_c pi_pot_cr
+#       Best-use potential profit. No planted-area weights at all, so it is
+#       defined on every cell GAEZ covers, cleared or not. This is the instrument
+#       with power where it is needed.
+#
+# 200a (agro-climatic, climate only) is the default: 200b folds in soil and
+# terrain, which are on the RHS as controls, so instrumenting with it leans on
+# variation the second stage is already conditioning away.
+
+if (HAS_GAEZ) {
+  gz <- xw[!is.na(gaez_a)]
+  log_message(sprintf("Building potential-profit instruments from %d GAEZ crops...",
+                      nrow(gz)))
+
+  ci2       <- match(dt$country_econ, price_w$country_iso3)
+  tau_v     <- dt$tau_r
+  pot_cell  <- numeric(nrow(dt))
+  pot_max   <- rep(NA_real_, nrow(dt))
+  pot_cellb <- numeric(nrow(dt))
+  n_pot     <- integer(nrow(dt))
+
+  for (i in seq_len(nrow(gz))) {
+    crop <- gz$earthstat[i]
+    if (!crop %in% names(price_w)) next
+    p <- price_w[[crop]][ci2]
+    gp <- glb_price[[crop]]
+    if (!is.null(gp) && is.finite(gp)) p[is.na(p)] <- gp
+    if (all(is.na(p))) next
+
+    s  <- dt[[gz$cropshare_col[i]]]
+    ya <- dt[[gz$gaez_a[i]]] / 1000            # kg/ha -> t/ha
+    pia <- (p - tau_v) * ya
+
+    ok <- !is.na(pia) & !is.na(s)
+    pot_cell[ok] <- pot_cell[ok] + s[ok] * pia[ok]
+    n_pot[ok]    <- n_pot[ok] + 1L
+    pot_max      <- pmax(pot_max, pia, na.rm = TRUE)
+
+    if (!is.na(gz$gaez_b[i])) {
+      yb  <- dt[[gz$gaez_b[i]]] / 1000
+      pib <- (p - tau_v) * yb
+      okb <- !is.na(pib) & !is.na(s)
+      pot_cellb[okb] <- pot_cellb[okb] + s[okb] * pib[okb]
+    }
+  }
+
+  # NOTE: these potential-profit measures are currently UNUSED. They were built
+  # to instrument realised profitability; that approach has been removed. They
+  # are kept because they are cheap to construct and are the natural candidate
+  # for entering the ladder DIRECTLY as an exogenous measure of land value -
+  # unlike the EarthStat measure they are defined on every cell and do not
+  # collapse when forest state is conditioned on. Delete this block if that is
+  # not wanted.
+  dt[, `:=`(pressure_pot_cell  = pot_cell,
+            pressure_pot_max   = pot_max,
+            pressure_pot_cellb = pot_cellb,
+            n_crops_pot        = n_pot)]
+  rm(pot_cell, pot_max, pot_cellb, n_pot, ci2, tau_v); gc()
+
+  for (v in c("pressure_pot_cell", "pressure_pot_max", "pressure_pot_cellb")) {
+    dt[, (paste0(v, "_100")) := get(v) / 100]
+  }
+}
 rm(press_cell, press_max, n_priced, ci, tau_r); gc()
 
 # Normalized variant: USD per hectare of CROPLAND rather than of cell. Undefined
@@ -466,6 +569,22 @@ FE_SPECS <- list(
   list(key = "country_biomeFE", fe = "country_iso3^biome",    label = "Country $\\times$ biome")
 )
 
+# Defined at top level, not inside run_fe_spec(): the IV section at the end of
+# the script also needs it, and a local copy left it invisible there ("object
+# 'LABEL' not found" killed job 1621938 after every model had already been fit).
+LABEL <- c(
+  pressure_cell_100    = "Agricultural profitability (\\$100/ha)",
+  fit_pressure_cell_100 = "Agricultural profitability (\\$100/ha)",
+  pressure_pot_max_100 = "Potential profitability, best use (\\$100/ha)",
+  slope_degrees        = "Slope (degrees)",
+  elevation_m          = "Elevation (m)",
+  pop_density_1990     = "Population density, 1990 (per km$^2$)",
+  forest_1990_pp       = "Forest cover, 1990 (pp)",
+  defor_9000_pp        = "Forest lost 1990--2000 (pp)",
+  agc_2010             = "Above-ground carbon (tCO$_2$/ha)",
+  biodiv_thr           = "Threatened species richness"
+)
+
 run_fe_spec <- function(FE_KEY, FE_FE, FE_LABEL) {
   log_message(sprintf("--- fixed effects: %s ---", FE_LABEL))
   m1 <- fit(mk_f(character(0), NULL))
@@ -551,16 +670,6 @@ run_fe_spec <- function(FE_KEY, FE_FE, FE_LABEL) {
   # row re-expressed as dollars per hectare of forgone agricultural profit. The
   # price variable is the numeraire, so it has no entry in (2).
 
-  LABEL <- c(
-    pressure_cell_100 = "Agricultural profitability (\\$100/ha)",
-    slope_degrees     = "Slope (degrees)",
-    elevation_m       = "Elevation (m)",
-    pop_density_1990  = "Population density, 1990 (per km$^2$)",
-    forest_1990_pp    = "Forest cover, 1990 (pp)",
-    defor_9000_pp     = "Forest lost 1990--2000 (pp)",
-    agc_2010          = "Above-ground carbon (tCO$_2$/ha)",
-    biodiv_thr        = "Threatened species richness"
-  )
 
   stars <- function(t) if (!is.finite(t)) "" else
                        if (abs(t) > 2.576) "^{***}" else
@@ -686,9 +795,7 @@ log_message(sprintf("Wrote %s",
 # Everything else in the specification is held at its column (5) form so the
 # heterogeneous slopes are comparable to the pooled number.
 
-MIN_CELLS_COUNTRY   <- 2000   # cells needed before a country gets its own slope
-MIN_TREATED_COUNTRY <- 100    # ... and treated cells, or the slope is noise
-MIN_TREATED_COHORT  <- 500
+MIN_TREATED_COHORT  <- 500    # cohorts are stacked; below this the stack is pointless
 
 RHS_CTRL <- c("slope_degrees", "elevation_m", "pop_density_1990",
               "forest_1990_pp", "defor_9000_pp", "agc_2010", "biodiv_thr")
@@ -700,18 +807,34 @@ RHS_CTRL <- c("slope_degrees", "elevation_m", "pop_density_1990",
 # the country FE still absorbs the level, so these are within-country slopes and
 # the pooled beta_p is their (precision-weighted) centre of mass.
 #
-# Countries are screened FIRST. A country with a handful of treated cells
-# produces a slope with no information but an eye-catching colour on a map, and
-# a reader cannot tell the two apart once it is filled in.
+# NO minimum-sample screen. Countries are excluded only where a slope does not
+# EXIST, never because it would be imprecise:
+#   n_treated == 0 or == n   the outcome is constant within the country, so the
+#                            country FE absorbs it entirely and fixest drops it
+#   sd(pressure) == 0        no regressor variation, so no slope to estimate
+# Everything else is kept however small. Precision is a separate problem from
+# identification, and a small country's noisy estimate is information to be
+# shrunk later, not information to discard now - 5_protection_lpm.R already
+# carries a normal-normal shrinkage step that does exactly this for country WTP.
+# Earlier thresholds (n >= 2000, treated >= 100) admitted 18 of 97 countries.
 
 ctry_n <- est[, .(n = .N, n_treated = sum(ever_protected),
                   sd_press = sd(pressure_cell_100)), by = country_iso3]
-keep_ctry <- ctry_n[n >= MIN_CELLS_COUNTRY & n_treated >= MIN_TREATED_COUNTRY &
-                    n_treated < n & sd_press > 0, country_iso3]
 
-log_message(sprintf("Country slopes: %d of %d countries pass the screen (n>=%d, treated>=%d)",
-                    length(keep_ctry), nrow(ctry_n),
-                    MIN_CELLS_COUNTRY, MIN_TREATED_COUNTRY))
+ctry_n[, identified := n_treated > 0 & n_treated < n &
+                       !is.na(sd_press) & sd_press > 0]
+keep_ctry <- ctry_n[identified == TRUE, country_iso3]
+
+log_message(sprintf("Country slopes: %d of %d countries identified (no size screen)",
+                    length(keep_ctry), nrow(ctry_n)))
+log_message(sprintf("  excluded: %d never protected, %d always protected, %d no pressure variation",
+                    ctry_n[n_treated == 0, .N],
+                    ctry_n[n_treated > 0 & n_treated >= n, .N],
+                    ctry_n[n_treated > 0 & n_treated < n &
+                           (is.na(sd_press) | sd_press <= 0), .N]))
+log_message(sprintf("  smallest retained country: %d cells, %d treated",
+                    ctry_n[identified == TRUE, min(n)],
+                    ctry_n[identified == TRUE, min(n_treated)]))
 
 est_c <- est[country_iso3 %chin% keep_ctry]
 
@@ -724,8 +847,20 @@ f_ctry <- as.formula(paste0(
   "ever_protected ~ i(country_iso3, pressure_cell_100) + ",
   paste(RHS_CTRL, collapse = " + "), " | country_iso3"))
 
+# glm.iter raised from the default 25: with ~60 country-specific slopes the IRLS
+# hit the iteration cap in job 1621938 ("Absence of convergence") and the VCOV
+# came back non-positive-semi-definite and silently "fixed", which makes every
+# reported SE untrustworthy. Convergence is checked explicitly below rather than
+# left to a warning that scrolls past.
 m_ctry <- feglm(f_ctry, est_c, family = binomial(), weights = ~area_km2,
-                vcov = cv())
+                vcov = cv(), glm.iter = 100)
+
+if (!isTRUE(m_ctry$convStatus)) {
+  log_message("  WARNING: country-slope logit did NOT converge - slopes and SEs are unreliable")
+} else {
+  log_message(sprintf("  converged in %s IRLS iterations",
+                      if (is.null(m_ctry$iterations)) "?" else m_ctry$iterations))
+}
 
 cb <- coef(m_ctry); cs <- sqrt(diag(vcov(m_ctry)))
 sel <- grep("^country_iso3::", names(cb))
@@ -744,19 +879,50 @@ beta_ctry[, t := beta / se]
 log_message(sprintf("  slopes estimated for %d countries; %d negative, %d significant at 5%%",
                     nrow(beta_ctry), beta_ctry[beta < 0, .N],
                     beta_ctry[abs(t) > 1.96, .N]))
+log_message(sprintf("  precision: %d with |t| < 1 (essentially uninformative), median |t| = %.2f",
+                    beta_ctry[abs(t) < 1, .N], median(abs(beta_ctry$t), na.rm = TRUE)))
+log_message(sprintf("  treated-cell count across mapped countries: min %d, median %d",
+                    min(beta_ctry$n_treated), as.integer(median(beta_ctry$n_treated))))
 
 world <- ne_countries(scale = "medium", returnclass = "sf")
-wmap  <- merge(world, beta_ctry, by.x = "iso_a3", by.y = "country_iso3",
-               all.x = TRUE)
 
-# Diverging scale centred on zero, symmetric so colour intensity is comparable
-# either side. Winsorized at the 5th/95th percentile of the estimated slopes so
-# one imprecise country does not flatten the rest of the map to a single hue.
-lim <- as.numeric(quantile(abs(beta_ctry$beta), 0.95, na.rm = TRUE))
+# ------------------------------------------------------------------------------
+# Winsorize the country slopes before mapping.
+# ------------------------------------------------------------------------------
+# With no size screen, a country identified off a handful of treated cells can
+# return an enormous slope. Unwinsorized, one such estimate sets the colour
+# scale and every other country collapses toward the midpoint - the map goes
+# white and reads as "no heterogeneity" when the opposite is true.
+#
+# The estimates THEMSELVES are winsorized, not merely the scale limits, so the
+# legend numbers correspond to what is actually drawn. Symmetric quantiles of
+# the signed distribution, so the zero midpoint stays meaningful and positive
+# and negative slopes are treated alike. What got clipped is logged.
+WINSOR_P <- 0.05
+
+lo_w <- as.numeric(quantile(beta_ctry$beta, WINSOR_P,     na.rm = TRUE))
+hi_w <- as.numeric(quantile(beta_ctry$beta, 1 - WINSOR_P, na.rm = TRUE))
+lim  <- max(abs(c(lo_w, hi_w)))          # symmetric about zero
+
+beta_ctry[, beta_w := pmax(pmin(beta, lim), -lim)]
+n_clip <- beta_ctry[abs(beta) > lim, .N]
+log_message(sprintf("  winsorized at +/-%.3f (%.0f%% tails): %d of %d countries clipped",
+                    lim, 100 * WINSOR_P, n_clip, nrow(beta_ctry)))
+if (n_clip > 0) {
+  log_message(sprintf("    clipped: %s",
+                      paste(sprintf("%s (%.2f)",
+                                    beta_ctry[abs(beta) > lim, country_iso3],
+                                    beta_ctry[abs(beta) > lim, beta]),
+                            collapse = ", ")))
+}
+log_message(sprintf("  raw slope range: [%.2f, %.2f]; mapped range: [%.2f, %.2f]",
+                    min(beta_ctry$beta), max(beta_ctry$beta), -lim, lim))
+
+wmap <- merge(world, beta_ctry, by.x = "iso_a3", by.y = "country_iso3",
+              all.x = TRUE)
 
 p_map <- ggplot(wmap) +
-  geom_sf(aes(fill = pmax(pmin(beta, lim), -lim)), colour = "gray70",
-          linewidth = 0.1) +
+  geom_sf(aes(fill = beta_w), colour = "gray70", linewidth = 0.1) +
   scale_fill_gradient2(low = "#08306b", mid = "white", high = "#67000d",
                        midpoint = 0, limits = c(-lim, lim), na.value = "gray92",
                        name = expression(beta[p])) +

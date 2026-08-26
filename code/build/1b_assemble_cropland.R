@@ -115,6 +115,81 @@ if (nrow(cropland_all) == 0) {
 }
 
 # ==============================================================================
+# ATTACH GAEZ ATTAINABLE YIELDS (Stage 0d)
+# ==============================================================================
+# Joined here rather than in a third file because it shares the grain exactly -
+# one row per grid_id, a time-invariant agronomic cross-section - and every
+# consumer wants it alongside the EarthStat layers. Optional: 0d is independent
+# of 0c and may not have run.
+
+gaez_files <- sapply(1:N_SUB_TILES, get_gaez_filename)
+gaez_exists <- file.exists(gaez_files)
+
+if (sum(gaez_exists) == 0) {
+  log_message("No Stage 0d (GAEZ) outputs found; cross-section will carry EarthStat only.")
+} else {
+  log_message(sprintf("Loading GAEZ sub-tile files (%d/%d present)...",
+                      sum(gaez_exists), N_SUB_TILES))
+  if (sum(gaez_exists) < N_SUB_TILES) {
+    log_message(sprintf("  WARNING: %d GAEZ sub-tiles MISSING",
+                        N_SUB_TILES - sum(gaez_exists)))
+  }
+
+  gaez_all <- rbindlist(lapply(gaez_files[gaez_exists], function(f) {
+    dt <- read_parquet(f); setDT(dt); dt
+  }), fill = TRUE)
+
+  log_message(sprintf("  GAEZ: %s cells, %d variables",
+                      format(nrow(gaez_all), big.mark = ","),
+                      ncol(gaez_all) - 1))
+
+  if (nrow(gaez_all) > 0) {
+    # An inner-join-shaped left join: cells absent from 0d keep NA GAEZ columns
+    # rather than being dropped, so a partial 0d cannot silently shrink the
+    # cross-section.
+    cropland_all <- merge(cropland_all, gaez_all, by = "grid_id", all.x = TRUE)
+    n_nogaez <- cropland_all[, sum(is.na(get(setdiff(names(gaez_all), "grid_id")[1])))]
+    log_message(sprintf("  cells with no GAEZ row: %s (%.2f%%)",
+                        format(n_nogaez, big.mark = ","),
+                        100 * n_nogaez / nrow(cropland_all)))
+  }
+  rm(gaez_all); gc()
+
+  # ----------------------------------------------------------------------------
+  # Composite GAEZ layers where one crop maps to several GAEZ codes.
+  # ----------------------------------------------------------------------------
+  # The crosswalk's gaez field is pipe-separated when GAEZ ships no aggregate
+  # layer for the crop. Rice is the case that forces this: GAEZ has ricd
+  # (dryland) and ricw (wetland) and no combined `rice`, and the attainable
+  # yield on a cell is the MAX of the two - a grower adopts the better system
+  # available there, so neither picking one nor averaging is right.
+  #
+  # pmax(na.rm = TRUE) returns NA only where every constituent is NA, so a cell
+  # suited to just one system keeps that system's yield rather than going NA.
+  xw_g <- fread(crop_crosswalk_file)
+  multi <- xw_g[nzchar(gaez) & grepl("|", gaez, fixed = TRUE)]
+
+  for (i in seq_len(nrow(multi))) {
+    crop  <- multi$earthstat[i]
+    parts <- strsplit(multi$gaez[i], "|", fixed = TRUE)[[1]]
+    for (v in c("200a", "200b")) {
+      src <- intersect(paste0("gaez_", parts, v), names(cropland_all))
+      if (length(src) < 2) {
+        log_message(sprintf("  WARNING: %s %s - only %d of %d source layers present, skipping composite",
+                            crop, v, length(src), length(parts)))
+        next
+      }
+      tgt <- paste0("gaez_", crop, v)
+      cropland_all[, (tgt) := do.call(pmax, c(.SD, list(na.rm = TRUE))),
+                   .SDcols = src]
+      log_message(sprintf("  composite %s = pmax(%s)  [mean %.1f kg/ha]",
+                          tgt, paste(src, collapse = ", "),
+                          mean(cropland_all[[tgt]], na.rm = TRUE)))
+    }
+  }
+}
+
+# ==============================================================================
 # ATTACH CELL METADATA
 # ==============================================================================
 # Carried so the cross-section stands alone for descriptives and mapping without
@@ -148,6 +223,14 @@ log_message(sprintf("After metadata join: %s cells",
 # ==============================================================================
 # DERIVED COLUMNS
 # ==============================================================================
+
+gaez_cols <- grep("^gaez_", names(cropland_all), value = TRUE)
+if (length(gaez_cols) > 0) {
+  log_message(sprintf("GAEZ layers present: %d (a: %d, b: %d)",
+                      length(gaez_cols),
+                      sum(grepl("200a$", gaez_cols)),
+                      sum(grepl("200b$", gaez_cols))))
+}
 
 cropshare_cols <- grep("^cropshare_", names(cropland_all), value = TRUE)
 cropshare_cols <- setdiff(cropshare_cols, "cropshare_total")
@@ -280,7 +363,8 @@ cat(sprintf("Source: %s\n\n", yields_path))
 cat(sprintf("Grid cells: %s\n", format(nrow(cropland_all), big.mark = ",")))
 cat(sprintf("Countries: %d\n", length(unique(cropland_all$country_iso3))))
 cat(sprintf("Crops (cropshare_*): %d\n", length(cropshare_cols)))
-cat(sprintf("Crops (yield_*): %d\n\n", length(yield_cols)))
+cat(sprintf("Crops (yield_*): %d\n", length(yield_cols)))
+cat(sprintf("GAEZ layers (gaez_*): %d\n\n", length(gaez_cols)))
 
 cat("Reference year: 2000 (EarthStat is a cross-section; join on grid_id)\n\n")
 

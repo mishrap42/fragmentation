@@ -90,15 +90,20 @@ fi
 frag_ensure_logs
 
 # Function to submit job and get job ID
+# dep_type defaults to afterok. Pass "afterany" for anything chained off the
+# 0c / 0d sub-tile ARRAYS: 40 of their 344 tasks have no grid geometry (empty
+# ocean sub-tiles) and always exit non-zero, so an afterok dependency on them
+# never fires and the child sits in the queue indefinitely.
 submit_job() {
     local script=$1
     local dependency=$2
     local description=$3
+    local dep_type=${4:-afterok}
 
     echo -e "${YELLOW}Submitting: $description${NC}"
 
     if [[ -n "$dependency" ]]; then
-        job_id=$(sbatch --parsable $SBATCH_COMMON --dependency=afterok:$dependency "$script")
+        job_id=$(sbatch --parsable $SBATCH_COMMON --dependency=$dep_type:$dependency "$script")
     else
         job_id=$(sbatch --parsable $SBATCH_COMMON "$script")
     fi
@@ -126,9 +131,14 @@ if [[ $START_STAGE -le 0 && $END_STAGE -ge 0 ]]; then
         # rather than near Stage 6 because it belongs to the extraction side of
         # the build: 0c is its only input, and nothing downstream consumes it.
         # It runs in parallel with the whole TMF chain instead of behind it.
+        # Waits on BOTH extraction arrays, with afterany because of the 40
+        # grid-less tasks in each. 1b tolerates missing sub-tiles and reports
+        # them, so afterany is correct rather than merely convenient.
         if [[ -f "code/bash/1b_assemble_cropland.sh" ]]; then
-            submit_job "code/bash/1b_assemble_cropland.sh" "$JOB_0C" \
-                "Stage 1b: Cropland Cross-Section (1 job)" > /dev/null
+            DEP_1B="$JOB_0C"
+            [[ -n "${JOB_0D:-}" ]] && DEP_1B="$JOB_0C:$JOB_0D"
+            submit_job "code/bash/1b_assemble_cropland.sh" "$DEP_1B" \
+                "Stage 1b: Cropland Cross-Section (1 job)" "afterany" > /dev/null
         fi
     fi
 fi

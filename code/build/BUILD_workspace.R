@@ -85,6 +85,35 @@ cropland_raster_path <- file.path(earthstat_path, 'Cropland2000_5m.tif')
 pasture_raster_path  <- file.path(earthstat_path, 'Pasture2000_5m.tif')
 
 # ------------------------------------------------------------------------------
+# GAEZ v4 agro-climatic / agro-ecological attainable yield, 1971-2000 baseline.
+# 150 flat GeoTIFFs, <crop><variant>_yld.tif, 75 crops x 2 variants, 5 arcmin
+# WGS84 - the same grid as EarthStat, so extraction reuses the 0c machinery.
+#
+# WHY GAEZ AS WELL AS EARTHSTAT
+# EarthStat yield is measured ON THE CROP'S HARVESTED AREA and is ZERO wherever
+# the crop is not grown, so on undisturbed forest it is identically zero. That
+# makes an EarthStat-based profitability measure nearly collinear with "is this
+# still forest", which is exactly what collapsed beta_p once forest cover and
+# carbon entered the siting logit. GAEZ is an agronomic simulation defined on
+# ALL land regardless of what is planted, so it varies independently of past
+# clearing.
+#
+# THE a / b VARIANTS (no documentation ships with the tree; characterised
+# empirically 2026-08-24 across maize, wheat, soybean and sugarcane):
+#   200a  positive on ~58% of land; the larger of the two
+#   200b  positive on a STRICT SUBSET of a's domain, and ~0.80-0.83 of a where
+#         both are positive; b > a essentially never (0.1-1.7% of cells)
+# That is the agro-CLIMATIC (a, climate only) vs agro-ECOLOGICAL (b, climate
+# plus soil and terrain) pair. Both are extracted and the choice is left to
+# analysis: b is the economically correct attainable yield, but it embeds
+# terrain and so partly duplicates a slope control, while a is climate-driven
+# variation that is cleaner with respect to terrain.
+#
+# UNITS: kg/ha dry matter. Divide by 1000 before meeting USD/tonne prices - the
+# companion repo's 4_build.R:1546 applies exactly this /1000.
+gaez_path <- file.path(spatial_path, 'GAEZv4', '19712000')
+
+# ------------------------------------------------------------------------------
 # Non-spatial economic inputs, shared with the Global Forest Repo. spatial_path
 # points at .../data/raw/spatial, so non-spatial is its sibling. Read-only here:
 # this project consumes those files, the companion owns them.
@@ -143,6 +172,7 @@ wdpa_output_path <- file.path(build_data_path, "wdpa")
 yields_output_path <- file.path(build_data_path, "yields")
 covariates_output_path <- file.path(build_data_path, "covariates")
 final_output_path <- file.path(build_data_path, "final")
+gaez_output_path <- file.path(build_data_path, "gaez")
 gfed_output_path <- file.path(build_data_path, "gfed")
 gfed_consolidated_path <- file.path(build_data_path, "gfed_consolidated")
 
@@ -165,7 +195,7 @@ cropland_final_file <- file.path(final_output_path, "TMF_5km_cropland.parquet")
 sapply(c(grid_output_path, tmf_output_path, consolidated_path,
          classification_path, wdpa_output_path, yields_output_path,
          covariates_output_path, final_output_path, gfed_output_path,
-         gfed_consolidated_path, lookup_path),
+         gfed_consolidated_path, lookup_path, gaez_output_path),
        function(p) if(!dir.exists(p)) dir.create(p, recursive = TRUE))
 
 # ==============================================================================
@@ -573,6 +603,40 @@ get_yield_varname <- function(filepath) {
   return(varname)
 }
 
+#' List the GAEZ v4 attainable-yield rasters
+#'
+#' Flat directory, one GeoTIFF per crop x variant. Matched on the _yld suffix so
+#' any other GAEZ theme dropped in later (suitability indices, crop calendars)
+#' is ignored rather than silently extracted as a yield.
+#'
+#' @return Character vector of full paths, sorted
+list_gaez_rasters <- function() {
+  if (!dir.exists(gaez_path)) {
+    warning(sprintf("GAEZ directory not found: %s", gaez_path))
+    return(character(0))
+  }
+  tifs <- list.files(gaez_path, pattern = "_yld\\.tif$", full.names = TRUE,
+                     ignore.case = TRUE)
+  if (length(tifs) == 0) {
+    warning(sprintf("No GAEZ *_yld.tif rasters found in: %s", gaez_path))
+  }
+  sort(tifs)
+}
+
+#' Column name for a GAEZ raster
+#'
+#' "maiz200a_yld.tif" -> "gaez_maiz200a". The gaez_ prefix is load-bearing: the
+#' EarthStat layers already own yield_<crop>, and the pre-2026-08 panel carried
+#' these same rasters as yield_maiz200a_yld through the fallback branch of
+#' get_yield_varname(), which is precisely the collision this avoids.
+#'
+#' @param filepath Path to a GAEZ raster
+#' @return Clean column name
+get_gaez_varname <- function(filepath) {
+  stem <- tools::file_path_sans_ext(basename(filepath))
+  paste0("gaez_", tolower(sub("_yld$", "", stem)))
+}
+
 #' List the EarthStat cropland / pasture fraction rasters
 #'
 #' The two 5-arcmin land-use layers that sit one level above the per-crop
@@ -667,6 +731,13 @@ gfed_to_raster <- function(nc_file, month) {
   burned_frac[is.na(burned_frac) | is.infinite(burned_frac)] <- 0
 
   return(burned_frac)
+}
+
+#' Get GAEZ output filename for a sub-tile
+#' @param sub_tile_id Sub-tile ID
+#' @return Path
+get_gaez_filename <- function(sub_tile_id) {
+  file.path(gaez_output_path, sprintf("gaez_sub_%04d.parquet", sub_tile_id))
 }
 
 #' Get covariates filename
